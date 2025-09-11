@@ -22,10 +22,10 @@ const MAX_REQS_PER_DOMAIN  = 200; // Total maximum "Requests made to this domain
 
 const REQ_GC_WINDOW_MS = 60_000; // GC seen requestIds
 const REQ_TTL_MS = 5_000;        // suppress duplicate events for same requestId
-const MAX_CONCURRENCY = 3;
+const MAX_CONCURRENCY = 10;
 
 // Throttle re-enqueues per registrable domain
-const ENQUEUE_TTL_MS = 30_000;
+const ENQUEUE_TTL_MS = 10_000;
 
 // Tab history: how long to keep past URLs (ms) and how many per tab
 const TAB_HISTORY_TTL_MS = 10 * 60_000; // 10 minutes ; kind of a hack so we can guess the right page, because some events have no navigation commits
@@ -428,7 +428,8 @@ async function rdapFetch(domain: string){
     const r = await fetch(url, {
       cache: "no-store",
       headers: { "accept": "application/rdap+json, application/json;q=0.9, */*;q=0.1" },
-      redirect: "follow"
+      redirect: "follow",
+      signal: AbortSignal.timeout(5000)
     });
     log('debug', `[rdap] ${domain} -> ok=${r.ok} status=${r.status} final=${r.url}`);
     return { ok: r.ok, status: r.status, finalUrl: r.url };
@@ -488,9 +489,14 @@ async function dnsCheckOne(name: string){
 
     // If any resolver came back with a transient condition, soft-fail.
     if ([a, aaaa, txt, ns].some(isSoft)) {
+      log('debug', `[doh] ${name} -> registered`);
+      return { status: 'registered' as Status, method: 'dns' as Method };
+/*
       log('warn', `[doh] ${name} -> SERVFAIL/REFUSED; soft-fail as 'unknown'`);
       return { status: 'unknown' as Status, method: 'dns' as Method };
+*/
     }
+
 
     const anyAns = hasAnswer(a) || hasAnswer(aaaa) || hasAnswer(txt) || hasAnswer(ns);
     const nxAll  = isNx(a) && isNx(aaaa) && isNx(txt) && isNx(ns);
