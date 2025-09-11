@@ -1,0 +1,584 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Batch Tab Opener — 100 at a time</title>
+    <style>
+      :root {
+        --bg: #0b0c10;
+        --card: #151820;
+        --text: #e6edf3;
+        --muted: #9aa4b2;
+        --accent: #4cc9f0;
+        --ok: #22c55e;
+        --warn: #f59e0b;
+        --err: #ef4444;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        font:
+          16px/1.45 system-ui,
+          -apple-system,
+          Segoe UI,
+          Roboto,
+          Ubuntu,
+          Cantarell,
+          Noto Sans,
+          'Helvetica Neue',
+          Arial,
+          'Apple Color Emoji',
+          'Segoe UI Emoji';
+        background: linear-gradient(180deg, #0b0c10, #0b0c10 200px, #0e1116 200px);
+        color: var(--text);
+      }
+      header {
+        padding: 28px 22px 14px;
+      }
+      header h1 {
+        margin: 0 0 6px;
+        font-size: 24px;
+        letter-spacing: 0.2px;
+      }
+      header p {
+        margin: 0;
+        color: var(--muted);
+      }
+      main {
+        padding: 12px 22px 40px;
+        max-width: 1100px;
+      }
+      .card {
+        background: var(--card);
+        border: 1px solid #222839;
+        border-radius: 18px;
+        padding: 18px;
+        box-shadow: 0 6px 20px rgba(0, 0, 0, 0.25);
+      }
+      .grid {
+        display: grid;
+        grid-template-columns: 1.1fr 0.9fr;
+        gap: 18px;
+      }
+      textarea {
+        width: 100%;
+        min-height: 360px;
+        resize: vertical;
+        border-radius: 12px;
+        border: 1px solid #2a3145;
+        background: #0f1219;
+        color: var(--text);
+        padding: 12px 14px;
+        font:
+          14px/1.4 ui-monospace,
+          SFMono-Regular,
+          Menlo,
+          Monaco,
+          Consolas,
+          'Liberation Mono',
+          'Courier New',
+          monospace;
+      }
+      .controls {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 12px;
+      }
+      .row {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 10px;
+        margin-bottom: 12px;
+      }
+      label {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        font-size: 13px;
+        color: var(--muted);
+      }
+      input[type='number'] {
+        width: 100%;
+        padding: 10px 12px;
+        border-radius: 10px;
+        border: 1px solid #2a3145;
+        background: #0f1219;
+        color: var(--text);
+      }
+      .btnbar {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        margin-top: 4px;
+      }
+      button {
+        appearance: none;
+        border: 1px solid #2a3145;
+        background: #111520;
+        color: var(--text);
+        padding: 10px 14px;
+        border-radius: 12px;
+        cursor: pointer;
+        transition:
+          0.18s transform ease,
+          0.18s background ease,
+          0.18s border-color ease;
+        font-weight: 600;
+      }
+      button:hover {
+        transform: translateY(-1px);
+        border-color: #384362;
+      }
+      button:active {
+        transform: translateY(0);
+      }
+      .primary {
+        background: linear-gradient(180deg, #172035, #0f1628);
+        border-color: #32415f;
+      }
+      .danger {
+        background: #1b1214;
+        border-color: #3a1f23;
+      }
+      .muted {
+        opacity: 0.85;
+      }
+
+      .console {
+        background: #0a0d15;
+        border: 1px solid #1f2637;
+        border-radius: 12px;
+        min-height: 160px;
+        padding: 10px 12px;
+        font:
+          12px/1.5 ui-monospace,
+          SFMono-Regular,
+          Menlo,
+          Monaco,
+          Consolas,
+          'Liberation Mono',
+          'Courier New',
+          monospace;
+        white-space: pre-wrap;
+        overflow: auto;
+      }
+      .statline {
+        display: flex;
+        gap: 12px;
+        flex-wrap: wrap;
+        color: var(--muted);
+        font-size: 13px;
+      }
+      .badge {
+        background: #0f1628;
+        border: 1px solid #29324a;
+        padding: 6px 10px;
+        border-radius: 999px;
+      }
+      .ok {
+        color: var(--ok);
+      }
+      .warn {
+        color: var(--warn);
+      }
+      .err {
+        color: var(--err);
+      }
+
+      @media (max-width: 980px) {
+        .grid {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>Batch Tab Opener</h1>
+      <p>
+        Opens <strong>100 links at a time</strong> in new tabs, waits, closes them, then proceeds to
+        the next 100.
+      </p>
+    </header>
+
+    <main>
+      <div class="grid">
+        <div class="card">
+          <label for="urls"><strong>Paste URLs (one per line)</strong></label>
+          <textarea
+            id="urls"
+            placeholder="https://example.com\nhttps://exodus.com\nhttps://github.com/...\n..."
+          ></textarea>
+        </div>
+
+        <div class="card">
+          <div class="row">
+            <label>
+              Batch size (tabs per round)
+              <input id="batchSize" type="number" min="1" max="200" step="1" value="100" />
+            </label>
+            <label>
+              Dwell per batch (seconds)
+              <input id="dwellSeconds" type="number" min="1" max="600" step="1" value="10" />
+            </label>
+          </div>
+          <div class="row">
+            <label>
+              Open throttle (ms between opens)
+              <input id="throttleMs" type="number" min="0" max="500" step="10" value="30" />
+            </label>
+            <label>
+              Close throttle (ms between closes)
+              <input id="closeThrottleMs" type="number" min="0" max="200" step="10" value="20" />
+            </label>
+          </div>
+          <div class="btnbar">
+            <button class="primary" id="startAll">Open all batches</button>
+            <button id="nextBatch">Open next 100 only</button>
+            <button class="danger" id="stop">Stop</button>
+            <button class="muted" id="testPopup">Test popup permission</button>
+            <button class="muted" id="clearLogs">Clear log</button>
+          </div>
+          <p style="color: var(--muted); margin-top: 10px">
+            Tip: Most browsers <em>require pop‑ups to be allowed</em> for this page. If you see
+            blocks, allow pop‑ups (🔒 → Site settings) and run again.
+          </p>
+        </div>
+      </div>
+
+      <div style="height: 14px"></div>
+
+      <div class="card">
+        <div class="statline" id="stats"></div>
+        <div class="console" id="console" aria-live="polite"></div>
+      </div>
+    </main>
+
+    <script>
+      (function () {
+        const els = {
+          urls: document.getElementById('urls'),
+          batchSize: document.getElementById('batchSize'),
+          dwellSeconds: document.getElementById('dwellSeconds'),
+          throttleMs: document.getElementById('throttleMs'),
+          closeThrottleMs: document.getElementById('closeThrottleMs'),
+          startAll: document.getElementById('startAll'),
+          nextBatch: document.getElementById('nextBatch'),
+          stop: document.getElementById('stop'),
+          testPopup: document.getElementById('testPopup'),
+          clearLogs: document.getElementById('clearLogs'),
+          console: document.getElementById('console'),
+          stats: document.getElementById('stats'),
+        };
+
+        const state = {
+          urls: [],
+          batches: [],
+          batchIndex: 0,
+          running: false,
+          openedHandles: [],
+          openedCount: 0,
+          closedCount: 0,
+          blockedCount: 0,
+        };
+
+        function log(msg, type) {
+          const time = new Date().toLocaleTimeString();
+          const color =
+            type === 'ok'
+              ? 'var(--ok)'
+              : type === 'warn'
+                ? 'var(--warn)'
+                : type === 'err'
+                  ? 'var(--err)'
+                  : 'var(--text)';
+          const line = document.createElement('div');
+          line.innerHTML = `<span style="color:var(--muted)">[${time}]</span> <span style="color:${color}">${escapeHtml(msg)}</span>`;
+          els.console.appendChild(line);
+          els.console.scrollTop = els.console.scrollHeight;
+        }
+
+        function setStats() {
+          els.stats.innerHTML = `
+          <span class="badge">Total URLs: <strong>${state.urls.length}</strong></span>
+          <span class="badge">Batch: <strong>${Math.min(state.batchIndex + 1, state.batches.length)} / ${state.batches.length || 0}</strong></span>
+          <span class="badge">Opened: <strong class="ok">${state.openedCount}</strong></span>
+          <span class="badge">Closed: <strong class="ok">${state.closedCount}</strong></span>
+          <span class="badge">Blocked: <strong class="warn">${state.blockedCount}</strong></span>
+        `;
+        }
+
+        function escapeHtml(s) {
+          return s.replace(
+            /[&<>"']/g,
+            (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c],
+          );
+        }
+
+        function parseUrls() {
+          const raw = els.urls.value
+            .split(/\r?\n/)
+            .map((s) => s.trim())
+            .filter(Boolean);
+          const urls = [];
+          for (const line of raw) {
+            const u = normalizeUrl(line);
+            if (u) urls.push(u);
+          }
+          return urls;
+        }
+
+        function normalizeUrl(s) {
+          try {
+            new URL(s);
+            return s;
+          } catch {}
+          // If no scheme, try https://
+          try {
+            new URL('https://' + s);
+            return 'https://' + s;
+          } catch {}
+          log(`Skipped invalid URL: ${s}`, 'warn');
+          return null;
+        }
+
+        function chunk(arr, size) {
+          const out = [];
+          for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+          return out;
+        }
+
+        const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+        // Synchronous opener to keep Firefox user-gesture active (esp. when popups are allowed for the origin)
+        function syncOpenBatch(batch) {
+          const handles = [];
+          for (const url of batch) {
+            // Open a blank tab synchronously, then navigate it — tends to be treated as a single gesture
+            const w = window.open(url, '_blank', '');
+            if (w && typeof w === 'object') {
+              try {
+                w.opener = null;
+              } catch {}
+              try {
+                w.location.href = url;
+              } catch {}
+              handles.push(w);
+              state.openedCount++;
+            } else {
+              state.blockedCount++;
+              log(`No window handle returned (popup policy) for: ${url}`, 'warn');
+            }
+          }
+          setStats();
+          log(
+            `Opened ${handles.length} tab(s)${state.blockedCount ? `, ${state.blockedCount} blocked` : ''}.`,
+            handles.length ? 'ok' : state.blockedCount ? 'warn' : undefined,
+          );
+          return handles;
+        }
+
+        async function openBatch(batch) {
+          const handles = [];
+          const throttle = Number(els.throttleMs.value) || 0;
+          for (const url of batch) {
+            // Some browsers block async opens unless popups are allowed for the site.
+            const w = window.open(url, '_blank', '');
+            if (w && typeof w === 'object') {
+              try {
+                w.opener = null;
+              } catch {}
+              handles.push(w);
+              state.openedCount++;
+            } else {
+              state.blockedCount++;
+              log(`No window handle returned (popup policy) for: ${url}`, 'warn');
+            }
+            if (throttle) await sleep(throttle);
+          }
+          setStats();
+          log(
+            `Opened ${handles.length} tab(s)${state.blockedCount ? `, ${state.blockedCount} blocked` : ''}.`,
+            handles.length ? 'ok' : state.blockedCount ? 'warn' : undefined,
+          );
+          return handles;
+        }
+
+        async function closeBatch(handles) {
+          const throttle = Number(els.closeThrottleMs.value) || 0;
+          let closed = 0;
+          for (const w of handles) {
+            try {
+              if (w && !w.closed) {
+                w.close();
+                closed++;
+                state.closedCount++;
+              }
+            } catch (e) {
+              // Cross-origin windows can still be closed via handle; ignore errors.
+            }
+            if (throttle) await sleep(throttle);
+          }
+          setStats();
+          log(`Closed ${closed} tab(s).`, 'ok');
+        }
+
+        async function processAllBatches() {
+          if (state.running) return;
+          state.running = true;
+          els.startAll.disabled = true;
+          els.nextBatch.disabled = true;
+          log('Starting automatic processing of all batches…');
+
+          while (state.running && state.batchIndex < state.batches.length) {
+            await processOneBatch();
+            // Proceed to next batch automatically
+            state.batchIndex++;
+          }
+
+          state.running = false;
+          els.startAll.disabled = false;
+          els.nextBatch.disabled = false;
+          log('Done.');
+        }
+
+        async function processOneBatch() {
+          const dwellMs = (Number(els.dwellSeconds.value) || 10) * 1000;
+          const batch = state.batches[state.batchIndex] || [];
+          log(
+            `\n— Batch ${state.batchIndex + 1} / ${state.batches.length} — (${batch.length} URLs)`,
+          );
+          state.openedHandles = await openBatch(batch);
+          if (!state.running) return;
+          if (dwellMs > 0) {
+            log(`Waiting ${Math.round(dwellMs / 1000)}s before closing…`, 'muted');
+            await sleep(dwellMs);
+          }
+          if (!state.running) return;
+          await closeBatch(state.openedHandles);
+          state.openedHandles = [];
+        }
+
+        function rebuildBatches() {
+          state.urls = parseUrls();
+          const size = Math.min(Math.max(Number(els.batchSize.value) || 100, 1), 200);
+          state.batches = chunk(state.urls, size);
+          state.batchIndex = 0;
+          state.openedCount = 0;
+          state.closedCount = 0;
+          state.blockedCount = 0;
+          setStats();
+          log(`Prepared ${state.batches.length} batch(es) of up to ${size} URLs.`);
+        }
+
+        // UI hooks
+        els.startAll.addEventListener('click', () => {
+          rebuildBatches();
+          if (!state.batches.length) return;
+
+          // Kick off FIRST batch synchronously to preserve user gesture in Firefox
+          const dwellMs = (Number(els.dwellSeconds.value) || 10) * 1000;
+          const first = state.batches[0] || [];
+          log(`
+— Batch 1 / ${state.batches.length} — (${first.length} URLs)`);
+          state.running = true;
+          els.startAll.disabled = true;
+          els.nextBatch.disabled = true;
+          state.openedHandles = syncOpenBatch(first);
+          state.batchIndex = 1; // we've just done batch 1
+
+          // Close later, then proceed with the remaining batches (async is fine if popups are allowed for the origin)
+          setTimeout(async () => {
+            if (!state.running) return;
+            await closeBatch(state.openedHandles);
+            state.openedHandles = [];
+            // We set running=false so processAllBatches() won't early-return
+            state.running = false;
+            await processAllBatches();
+          }, dwellMs);
+        });
+
+        els.nextBatch.addEventListener('click', async () => {
+          if (!state.running) {
+            rebuildBatches();
+            if (!state.batches.length) return;
+            const dwellMs = (Number(els.dwellSeconds.value) || 10) * 1000;
+            const batch = state.batches[state.batchIndex] || [];
+            log(`
+— Batch ${state.batchIndex + 1} / ${state.batches.length} — (${batch.length} URLs)`);
+            state.running = true; // treat as a single-batch run
+            els.startAll.disabled = true;
+            els.nextBatch.disabled = true;
+            state.openedHandles = syncOpenBatch(batch);
+            setTimeout(async () => {
+              await closeBatch(state.openedHandles);
+              state.openedHandles = [];
+              state.batchIndex++;
+              state.running = false;
+              els.startAll.disabled = false;
+              els.nextBatch.disabled = false;
+              log('Batch finished.');
+            }, dwellMs);
+          }
+        });
+
+        els.stop.addEventListener('click', async () => {
+          state.running = false;
+          log('Stopping after current operation…', 'warn');
+          try {
+            if (state.openedHandles.length) {
+              await closeBatch(state.openedHandles);
+              state.openedHandles = [];
+            }
+          } catch {}
+        });
+
+        els.testPopup.addEventListener('click', () => {
+          const probe = window.open('about:blank', '_blank', 'popup,width=300,height=200');
+          if (probe && typeof probe === 'object') {
+            try {
+              probe.document.write(
+                '<title>Popup test</title><body style="font:14px system-ui;padding:10px">✅ Popups allowed.</body>',
+              );
+            } catch {}
+            try {
+              probe.close();
+            } catch {}
+            log('✅ Popups appear allowed for this site.', 'ok');
+          } else {
+            log(
+              '⚠️ Popup was blocked. Allow pop‑ups for this site (🔒 icon → Site settings).',
+              'warn',
+            );
+          }
+        });
+
+        els.clearLogs.addEventListener('click', () => {
+          els.console.textContent = '';
+        });
+
+        // Recompute batches when size changes (for accurate preview of counts)
+        els.batchSize.addEventListener('change', rebuildBatches);
+        els.urls.addEventListener('blur', rebuildBatches);
+
+        // Initial stats
+        setStats();
+        log('Paste your URLs, then click “Open all batches” to begin.');
+        // Warn about Firefox + file:// which cannot be whitelisted for popups
+        try {
+          const isFirefox = /Firefox\//.test(navigator.userAgent);
+          const isFile = location.protocol === 'file:';
+          if (isFirefox && isFile) {
+            log(
+              '⚠️ Firefox + file:// severely restricts programmatic tab opening. Serve this file via http://localhost and allow pop-ups for that origin.',
+              'warn',
+            );
+          }
+        } catch {}
+      })();
+    </script>
+  </body>
+</html>

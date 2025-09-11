@@ -1,0 +1,55 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>NXDOMAIN'd</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <header>
+      <h1>NXDOMAIN'D</h1>
+      <div id="counts">
+        <span id="avail-count">0</span> unregistered
+        <span class="sep">•</span>
+        <span id="cache-count">0</span> cached
+        <span class="sep">•</span>
+        <span id="hosts-count">0</span> hosts seen
+      </div>
+    </header>
+
+    <div id="controls">
+      <button id="copy">Copy domains</button>
+      <button id="copy2">Copy domains + pages + requests</button>
+      <button id="clear">Clear list</button>
+      <button id="clear-cache">Clear cache</button>
+    </div>
+
+    <ul id="list"></ul>
+
+    <details id="debug">
+      <summary>Debug</summary>
+      <label><input type="checkbox" id="debug-toggle" /> Enable verbose logging</label>
+      <button id="debug-refresh">Refresh logs</button>
+      <button id="debug-clear">Clear logs</button>
+      <pre
+        id="debug-logs"
+        style="
+          max-height: 240px;
+          overflow: auto;
+          background: #fafafa;
+          padding: 8px;
+          border: 1px solid #eee;
+        "
+      ></pre>
+    </details>
+
+    <footer>
+      <p class="hint">
+        <a href="https://github.com/megamansec/nxdomaind">nxdomain'd by Joshua Rogers</a>
+      </p>
+    </footer>
+
+    <script src="popup.js"></script>
+  </body>
+</html>
