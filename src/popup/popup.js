@@ -1,27 +1,61 @@
-function fmt(ts){ return new Date(ts).toLocaleString(); }
 function mkli(text){ const e=document.createElement('li'); e.textContent=text; return e; }
 function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
 function withTimeout(p, ms=500){
-  return Promise.race([p, new Promise((_,rej)=>setTimeout(()=>rej(new Error('timeout')), ms))]);
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error('timeout')), ms);
+    p.then(v => { clearTimeout(t); resolve(v); },
+           e => { clearTimeout(t); reject(e); });
+  });
 }
+function fmt(ts){
+  const n = Number(ts);
+  if (!Number.isFinite(n) || n <= 0) return '';
+  const d = new Date(n);
+  return Number.isNaN(d.getTime()) ? '' : d.toLocaleString();
+}
+
 function fmtNum(n){
-  try { return new Intl.NumberFormat(undefined, { notation: 'compact' }).format(n); }
-  catch { return String(n); }
+  try {
+    return new Intl.NumberFormat(undefined, { notation: 'compact' }).format(n);
+  } catch {
+    return String(n);
+  }
+}
+
+function sendMessageP(message) {
+  return new Promise((resolve, reject) => {
+    let maybePromise;
+    try {
+      maybePromise = chrome.runtime.sendMessage(message, (response) => {
+        const err = chrome.runtime.lastError;
+        if (err) reject(err);
+        else resolve(response);
+      });
+    } catch (e) {
+      reject(e);
+      return;
+    }
+    if (maybePromise && typeof maybePromise.then === 'function') {
+      maybePromise.then(resolve, reject);
+    }
+  });
 }
 
 async function getSafeState(){
-  // Try to ask the background (worker may be cold). One retry with a tiny delay.
+  // Try background first (worker may be cold). A couple quick retries.
   for (let i = 0; i < 2; i++){
     try {
-      const state = await withTimeout(chrome.runtime.sendMessage({ type: "getState" }), 600);
+      const state = await withTimeout(sendMessageP({ type: "getState" }), 1200);
       if (state && typeof state === 'object') return state;
     } catch {}
     await sleep(150);
   }
 
-  // Fallback: storage snapshot (may be stale/incomplete if background doesn't persist everything)
+  // Fallback: storage snapshot
   try {
-    const s = await new Promise(res => chrome.storage.local.get(["availableList","hostSeen","domainStatus"], res));
+    const s = await new Promise(res =>
+      chrome.storage.local.get(["availableList","hostSeen","domainStatus"], res)
+    );
     return {
       availableList: Array.isArray(s.availableList) ? s.availableList : [],
       cacheSize: s.domainStatus ? Object.keys(s.domainStatus).length : 0,
@@ -79,6 +113,8 @@ async function refresh(){
       const pages = Array.isArray(item.pages) ? item.pages : [];
       const reqs  = Array.isArray(item.requests) ? item.requests : [];
 
+      li.appendChild(row);
+
       if (pages.length){
         const pagesTitle = document.createElement("div");
         pagesTitle.className = "section-title";
@@ -111,7 +147,6 @@ async function refresh(){
       });
       actions.appendChild(recheck);
 
-      li.appendChild(row);
       li.appendChild(actions);
       ul.appendChild(li);
     });
@@ -150,9 +185,17 @@ document.getElementById("copy")?.addEventListener("click", async () => {
   try { await navigator.clipboard.writeText(text); alert(`Copied ${list.length} domain(s).`); }
   catch {
     const ta = document.createElement("textarea");
-    ta.value = text; document.body.appendChild(ta); ta.select();
-    document.execCommand("copy"); document.body.removeChild(ta);
-    alert(`Copied ${list.length} domain(s).`);
+    ta.value = text;
+    ta.style.position = "fixed";
+    ta.style.top = "-1000px";
+    document.body.appendChild(ta);
+    try {
+      ta.select();
+      document.execCommand("copy");
+      alert(`Copied ${list.length} domain(s).`);
+    } finally {
+      try { document.body.removeChild(ta); } catch {}
+    }
   }
 });
 
@@ -177,9 +220,17 @@ document.getElementById("copy2")?.addEventListener("click", async () => {
   try { await navigator.clipboard.writeText(text); alert(`Copied ${lines.length} line(s).`); }
   catch {
     const ta = document.createElement("textarea");
-    ta.value = text; document.body.appendChild(ta); ta.select();
-    document.execCommand("copy"); document.body.removeChild(ta);
-    alert(`Copied ${lines.length} line(s).`);
+    ta.value = text;
+    ta.style.position = "fixed";
+    ta.style.top = "-1000px";
+    document.body.appendChild(ta);
+    try {
+      ta.select();
+      document.execCommand("copy");
+      alert(`Copied ${list.length} domain(s).`);
+    } finally {
+      try { document.body.removeChild(ta); } catch {}
+    }
   }
 });
 
@@ -188,21 +239,21 @@ document.getElementById("clear")?.addEventListener("click", async () => {
   await refresh();
 });
 
-
 document.getElementById("clear-cache")?.addEventListener("click", async () => {
   if (!confirm("Clear cached domains/hosts? This will force re-checking.")) return;
   try { await chrome.runtime.sendMessage({ type: "clearCache" }); } catch {}
   await refresh();
 });
 
-
-async function loadLogs(){
+async function loadLogs() {
   try {
-    const { logs, debugEnabled } = await chrome.runtime.sendMessage({ type: "getLogs" });
+    const resp = await sendMessageP({ type: "getLogs" });
+    const { logs = [], debugEnabled = false } = resp || {};
+
     const box = document.getElementById("debug-logs");
     const chk = document.getElementById("debug-toggle");
     if (chk) chk.checked = !!debugEnabled;
-    if (Array.isArray(logs) && box){
+    if (Array.isArray(logs) && box) {
       const lines = logs.slice(-300).map(e => {
         const ts = new Date(e.ts || Date.now()).toISOString();
         return `${ts} [${e.level}] ${e.msg}`;

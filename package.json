@@ -1,7 +1,7 @@
 {
   "name": "NXDOMAIN-watcher",
   "description": "Watch browser network traffic for domains, and check whether they're unregistered.",
-  "version": "1.0.0",
+  "version": "1.0.2",
   "private": false,
   "type": "module",
   "scripts": {

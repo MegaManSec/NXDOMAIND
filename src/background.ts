@@ -36,8 +36,18 @@ const MAX_LOGS = 400; // How many lines of logs to keep
 const LOG_TTL_MS = 15 * 60_000; // How long to keep logs; 15 minutes
 
 const storage = {
-  get: (keys: string[]) => new Promise<any>((res) => chrome.storage.local.get(keys, res)),
-  set: (obj: any) => new Promise<void>((res) => chrome.storage.local.set(obj, res)),
+  get: (keys: string[]) => new Promise<any>((res, rej) =>
+    chrome.storage.local.get(keys, (val) => {
+      const err = chrome.runtime.lastError;
+      return err ? rej(err) : res(val);
+    })
+  ),
+  set: (obj: any) => new Promise<void>((res, rej) =>
+    chrome.storage.local.set(obj, () => {
+      const err = chrome.runtime.lastError;
+      return err ? rej(err) : res();
+    })
+  ),
 };
 
 // MV3 (chrome.action) vs MV2 (browserAction) wrapper
@@ -180,20 +190,20 @@ function lookupFrameHistory(tabId: number, frameId: number, origin?: string): st
 type PageSource = 'documentUrl'|'originUrl'|'initiator'|'tabTopUrl'|'tabHistory'|'frameHistory'|'none';
 
 /** Prefer full path; upgrade origin-only or missing pages via frame & tab history for robustness. */
-function pageFromVerbose(details: any, tabId?: number, frameId?: number): { url?: string, source: PageSource } {
+function pageFromVerbose(details:any, tabId?:number, frameId?:number){
   let url: string | undefined;
   let source: PageSource = 'none';
   try {
-    const d = details || {};
-    // 0) If we know the frame, prefer its exact history first
+    // Prefer frame history *first*
     if (typeof tabId === 'number' && typeof frameId === 'number') {
       const fh = lookupFrameHistory(tabId, frameId);
       if (fh) { url = fh; source = 'frameHistory'; }
     }
-    if (d.documentUrl) { url = String(d.documentUrl); source = 'documentUrl'; }
-    else if (d.originUrl) { url = String(d.originUrl); source = 'originUrl'; }
-    else if (d.initiator) { url = String(d.initiator); source = 'initiator'; }
-    else if (typeof tabId === 'number' && tabTopUrl[tabId]) { url = tabTopUrl[tabId]; source = 'tabTopUrl'; }
+    // Only set these if we *still* don't have a URL
+    if (!url && details?.documentUrl) { url = String(details.documentUrl); source = 'documentUrl'; }
+    else if (!url && details?.originUrl) { url = String(details.originUrl); source = 'originUrl'; }
+    else if (!url && details?.initiator) { url = String(details.initiator); source = 'initiator'; }
+    else if (!url && typeof tabId === 'number' && tabTopUrl[tabId]) { url = tabTopUrl[tabId]; source = 'tabTopUrl'; }
 
     const onlyOrigin = (() => {
       if (!url) return false;
@@ -259,8 +269,8 @@ const ICONS = {
 
 async function updateBadge(){
   const count = availableList.length;
-  await act.setBadgeText({ text: count ? String(count) : "" });
-  await act.setBadgeBackgroundColor({ color: hasNew ? "#d93025" : "#1a73e8" });
+  try { await act.setBadgeText({ text: count ? String(count) : "" }); } catch {}
+  try { await act.setBadgeBackgroundColor({ color: hasNew ? "#d93025" : "#1a73e8" }); } catch {}
   const working = isWorking();
   try { await act.setIcon({ path: working ? ICONS.yellow : ICONS.blue }); } catch {}
 }
@@ -560,8 +570,8 @@ function mergeContextsInto(cands: string[], into: DomainInfo){
   for (const cand of cands){
     const ds = domainStatus[cand];
     if (!ds) continue;
-    (ds.pages ?? []).forEach(p => pages.set(p.url, Math.max(pages.get(p.url) || 0, p.ts)));
-    (ds.requests ?? []).forEach(r => reqs.set(r.url, Math.max(reqs.get(r.url) || 0, r.ts)));
+    (ds.pages ?? []).forEach(p => pages.set(p.url, Math.max(pages.get(p.url) || 0, Number(p.ts) || 0)));
+    (ds.requests ?? []).forEach(r => reqs.set(r.url, Math.max(reqs.get(r.url) || 0, Number(r.ts) || 0)));
   }
   const mergedPages = Array.from(pages.entries()).map(([url, ts])=>({url, ts})).sort((a,b)=>b.ts-a.ts).slice(0, MAX_PAGES_PER_DOMAIN);
   const mergedReqs  = Array.from(reqs.entries()).map(([url, ts])=>({url, ts})).sort((a,b)=>b.ts-a.ts).slice(0, MAX_REQS_PER_DOMAIN);
@@ -899,45 +909,67 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
-  if (msg?.type === "cspViolation" && typeof msg.blockedURL === "string"){
+  if (msg?.type === "cspViolation"){
     try {
-      log('debug', `[signal:cspViolation] blocked=${msg.blockedURL} document=${msg.documentURL ?? '-'} tabUrl=${(sender?.tab && (sender.tab as any).url) || '-'}`);
-      const u = new URL(msg.blockedURL);
-      const host = normalizeHost(u.hostname);
-      if (host){
-        const info = parse(host);
-        if (info.domain && info.isIcann && !info.isIp){
-          const registrable = info.domain;
-          // try to upgrade doc URL to full path using tab history if it's origin-only
-          const rawPage = msg.documentURL || (sender?.tab && (sender.tab as any).url) || undefined;
-          let pageUrl = rawPage;
-          try {
-            if (rawPage && sender?.tab?.id != null) {
-              const ru = new URL(rawPage);
-              const onlyOrigin = (ru.pathname === '/' && !ru.search && !ru.hash);
-              if (onlyOrigin) {
-                const hist = lookupTabHistory(sender.tab.id, ru.origin);
-                if (hist) pageUrl = hist;
-              }
-            }
-          } catch {}
-          if (!pageUrl && sender?.tab?.id != null) {
-            const hist = lookupTabHistory(sender.tab.id);
+      const raw = typeof msg.blockedURL === "string" ? msg.blockedURL : "";
+      const tabUrl = (sender?.tab && (sender.tab as any).url) || "-";
+      log('debug', `[signal:cspViolation] blocked=${raw || '-'} document=${msg.documentURL ?? '-'} tabUrl=${tabUrl}`);
+
+      // Page URL (document), upgraded via tab history if only-origin.
+      const rawPage = (typeof msg.documentURL === 'string' ? msg.documentURL : undefined) ||
+                      (typeof tabUrl === 'string' && tabUrl !== "-" ? tabUrl : undefined);
+      let pageUrl: string | undefined = rawPage;
+      try {
+        if (rawPage && sender?.tab?.id != null) {
+          const ru = new URL(rawPage);
+          const onlyOrigin = (ru.pathname === '/' && !ru.search && !ru.hash);
+          if (onlyOrigin) {
+            const hist = lookupTabHistory(sender.tab.id, ru.origin);
             if (hist) pageUrl = hist;
           }
-
-          if (pageUrl) addPageContext(registrable, pageUrl);
-          addRequestContext(registrable, u.href);
-          if (!domainStatus[registrable]) {
-            domainStatus[registrable] = { status: 'pending', method: null, http: 0, url: '', ts: now(), pages: [], requests: [] };
-            log('debug', `[state] set pending ${registrable}`);
-          }
-          ensureEnqueued(registrable, host, 'cspViolation');
-        } else {
-          log('debug', `[signal:cspViolation] skip-tldts host=${host} isIp=${info.isIp} isIcann=${info.isIcann}`);
         }
+      } catch {}
+      if (!pageUrl && sender?.tab?.id != null) {
+        const hist = lookupTabHistory(sender.tab.id);
+        if (hist) pageUrl = hist;
+      }
+
+      // Derive blocked host when possible (http/https or blob:https://...).
+      let blockedHost: string | null = null;
+      if (/^https?:/i.test(raw)) {
+        try { blockedHost = normalizeHost(new URL(raw).hostname); } catch {}
+      } else if (raw.startsWith('blob:')) {
+        const inner = raw.slice(5);
+        try { blockedHost = normalizeHost(new URL(inner).hostname); } catch {}
+      }
+
+      // Prefer attributing to the page's registrable; fall back to blocked host.
+      let registrable: string | null = null;
+      try {
+        if (pageUrl) {
+          const ph = normalizeHost(new URL(pageUrl).hostname);
+          const info = ph ? parse(ph) : ({} as any);
+          if (info.domain && info.isIcann && !info.isIp) registrable = info.domain;
+        }
+      } catch {}
+      if (!registrable && blockedHost) {
+        const info = parse(blockedHost);
+        if (info.domain && info.isIcann && !info.isIp) registrable = info.domain;
+      }
+
+      if (registrable) {
+        // Context: record page; only record request if it's a real http(s) URL.
+        if (pageUrl) addPageContext(registrable, pageUrl);
+        if (blockedHost && /^https?:/i.test(raw)) addRequestContext(registrable, raw);
+
+        if (!domainStatus[registrable]) {
+          domainStatus[registrable] = { status: 'pending', method: null, http: 0, url: '', ts: now(), pages: [], requests: [] };
+          log('debug', `[state] set pending ${registrable}`);
+        }
+        // Keep queue/active semantics consistent with other signals.
+        ensureEnqueued(registrable, blockedHost || registrable, 'cspViolation');
       } else {
-        log('debug', `[signal:cspViolation] skip-host host=${host}`);
+        log('debug', `[signal:cspViolation] skip (no registrable) blockedHost=${blockedHost ?? '-'} pageUrl=${pageUrl ?? '-'}`);
       }
     } catch (e) {
       log('error', 'cspViolation handler failed: ' + errToStr(e));
@@ -951,11 +983,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     const d = normalizeHost(msg.domain);
     if (d){
       delete domainStatus[d];
-      delete lastQueued[d]; // allow immediate re-enqueue
+      delete lastQueued[d];
       const host = itemToHost.get(d) || d;
-      itemToHost.set(d, host);
-      if (!queue.includes(d)) queue.push(d);
-      void processQueue();
+      ensureEnqueued(d, host, 'recheck');
       sendResponse({ ok: true });
     } else {
       sendResponse({ ok: false });
