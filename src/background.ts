@@ -15,13 +15,13 @@ interface DomainInfo {
   requests?: PageRef[];
 }
 
-const MAX_DOMAINS = 1_000_000_000; // Total maximum *domains* (eTLD+1, domain.com) kept in the cache.
-const MAX_HOSTS = 1_000_000_000; // Total maximum *hosts* (subdomain.domain.com) kept in the cache.
+const MAX_DOMAINS = 1_000_000; // Total maximum *domains* (eTLD+1, domain.com) kept in the cache.
+const MAX_HOSTS = 1_000_000; // Total maximum *hosts* (subdomain.domain.com) kept in the cache.
 const MAX_PAGES_PER_DOMAIN = 200; // Total maximum "Pages observed on:" (https://html-viewer.com/)
 const MAX_REQS_PER_DOMAIN  = 200; // Total maximum "Requests made to this domain:" (https://example.com/page1, https://example.com/page2)
 
 const REQ_GC_WINDOW_MS = 60_000; // GC seen requestIds
-const REQ_TTL_MS = 5_000;        // suppress duplicate events for same requestId
+const REQ_TTL_MS = 1_500;        // suppress duplicate events for same requestId
 const MAX_CONCURRENCY = 10;
 
 // Throttle re-enqueues per registrable domain
@@ -120,7 +120,7 @@ function now(){ return Date.now(); }
 
 function normalizeHost(h?: string | null){
   if (!h) return null;
-  const x = h.trim().toLowerCase().replace(/:\d+$/, "").replace(/\.$/, "");
+  const x = h.trim().toLowerCase().replace(/\.$/, "");
   return x || null;
 }
 
@@ -421,23 +421,44 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 });
 
 // RDAP
-async function rdapFetch(domain: string){
-  const url = `https://rdap.org/domain/${encodeURIComponent(domain)}`;
+async function rdapFetch(domain: string) {
+  const makeUrl = (d: string) => `https://rdap.org/domain/${encodeURIComponent(d)}`;
+
+  const attempt = async (url: string, ms: number) => {
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), ms);
+    try {
+      log('debug', `[rdap] GET ${url}`);
+      const r = await fetch(url, {
+        cache: "no-store",
+        headers: { accept: "application/rdap+json, application/json;q=0.9, */*;q=0.1" },
+        redirect: "follow",
+        signal: ctl.signal
+      });
+      log('debug', `[rdap] ${domain} -> ok=${r.ok} status=${r.status} final=${r.url}`);
+      return { ok: r.ok, status: r.status, finalUrl: r.url };
+    } finally {
+      clearTimeout(t);
+    }
+  };
+
+  const url = makeUrl(domain);
+
   try {
-    log('debug', `[rdap] GET ${url}`);
-    const r = await fetch(url, {
-      cache: "no-store",
-      headers: { "accept": "application/rdap+json, application/json;q=0.9, */*;q=0.1" },
-      redirect: "follow",
-      signal: AbortSignal.timeout(5000)
-    });
-    log('debug', `[rdap] ${domain} -> ok=${r.ok} status=${r.status} final=${r.url}`);
-    return { ok: r.ok, status: r.status, finalUrl: r.url };
-  } catch (e){
-    // Clearer label: this is a transport failure, not a domain result.
-    log('warn', `[rdap] network/timeout fetching ${url}: ${errToStr(e)}`);
+    // Primary attempt
+    return await attempt(url, 5000);
+  } catch (e1) {
+    log('warn', `[rdap] primary failed -> ${errToStr(e1)}; retrying`);
     persistLogsSoon();
-    return { ok: false, status: 0, finalUrl: url };
+    try {
+      // Single retry with a slightly longer budget
+      return await attempt(url, 7000);
+    } catch (e2) {
+      log('warn', `[rdap] retry failed -> ${errToStr(e2)}`);
+      persistLogsSoon();
+      // Transport failure; not a domain verdict
+      return { ok: false, status: 0, finalUrl: url };
+    }
   }
 }
 
@@ -1014,5 +1035,7 @@ async function init(){
   await updateBadge();
   void processQueue();
 }
+
+
 
 void init();
