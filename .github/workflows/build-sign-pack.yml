@@ -1,0 +1,85 @@
+name: Build & Sign (pnpm, Chrome + Firefox)
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    env:
+      AMO_JWT_ISSUER: ${{ secrets.AMO_JWT_ISSUER }}
+      AMO_JWT_SECRET: ${{ secrets.AMO_JWT_SECRET }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Install pnpm first so setup-node can query the pnpm store for caching
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Install deps
+        run: pnpm install --frozen-lockfile --ignore-scripts
+
+      # ---------- Build Chrome ----------
+      - name: Build Chrome
+        run: pnpm run build:chrome
+
+      - name: Package Chrome (.zip)
+        run: |
+          (cd dist/chrome && zip -r ../../artifacts/chrome/nxdomain-watcher-chrome.zip .)
+
+      # ---------- Build Firefox ----------
+      - name: Build Firefox
+        run: pnpm run build:firefox
+
+      # ---------- Sign Firefox ----------
+      - name: Sign Firefox XPI (unlisted / self-distributed)
+        env:
+          WEB_EXT_API_KEY: ${{ secrets.AMO_JWT_ISSUER }}
+          WEB_EXT_API_SECRET: ${{ secrets.AMO_JWT_SECRET }}
+        run: |
+          pnpm run sign:firefox
+
+      # ---------- Upload CI artifacts (ephemeral) ----------
+      - name: Upload Chrome artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nxdomain-watcher-chrome-${{ github.ref_name }}-${{ github.sha }}
+          path: artifacts/chrome/*.zip
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload Firefox artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nxdomain-watcher-firefox-${{ github.ref_name }}-${{ github.sha }}
+          path: artifacts/firefox/*.xpi
+          if-no-files-found: error
+          retention-days: 14
+
+      # ---------- Publish permanent assets on tag ----------
+      - name: Upload to GitHub Release (on tags)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/chrome/*.zip
+            artifacts/firefox/*.xpi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

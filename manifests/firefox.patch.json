@@ -1,0 +1,35 @@
+{
+  "manifest_version": 2,
+  "background": {
+    "scripts": [
+      "background.js"
+    ]
+  },
+  "permissions": [
+    "storage",
+    "tabs",
+    "webNavigation",
+    "webRequest",
+    "<all_urls>",
+    "unlimitedStorage"
+  ],
+  "browser_action": {
+    "default_popup": "popup.html",
+    "default_title": "NXDOMAIN'd",
+    "default_icon": {
+      "16": "icons/icon16-blue.png",
+      "32": "icons/icon32-blue.png",
+      "128": "icons/icon128-blue.png"
+    }
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "nxdomain@joshua.hu",
+      "strict_min_version": "115.0"
+    }
+  },
+  "developer": {
+    "name": "Joshua Rogers (@MegaManSec)",
+    "url": "https://github.com/megamansec/nxdomaind"
+  }
+}

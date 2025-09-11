@@ -1,0 +1,37 @@
+{
+  "name": "NXDOMAIN-watcher",
+  "description": "Watch browser network traffic for domains, and check whether they're unregistered.",
+  "version": "1.0.0",
+  "private": false,
+  "type": "module",
+  "scripts": {
+    "prepare": "pnpm install --lockfile-only",
+    "install": "pnpm install --lockfile-only",
+    "build:chrome": "node scripts/build.mjs chrome",
+    "build:firefox": "node scripts/build.mjs firefox",
+    "build": "pnpm run build:chrome && pnpm run build:firefox",
+    "dev:chrome": "web-ext run --target=chromium --source-dir=dist/chrome",
+    "dev:firefox": "web-ext run --source-dir=dist/firefox",
+    "sign:firefox": "web-ext sign --source-dir=dist/firefox --artifacts-dir=artifacts/firefox --channel=unlisted",
+    "clean": "rimraf dist",
+    "preinstall": "npx -y only-allow pnpm"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/megamansec/nxdomaind"
+  },
+  "author": "Joshua Rogers (@MegaManSec)",
+  "license": "GPLv3",
+  "bugs": {
+    "url": "https://github.com/megamansec/nxdomaind/issues"
+  },
+  "homepage": "https://github.com/megamansec/nxdomaind",
+  "devDependencies": {
+    "esbuild": "^0.25.9",
+    "rimraf": "^6.0.1",
+    "web-ext": "^8.9.0"
+  },
+  "dependencies": {
+    "tldts": "^7.0.13"
+  }
+}
