@@ -1036,6 +1036,47 @@ async function init(){
   void processQueue();
 }
 
+// --- Keepalive for Chrome MV3 service worker only; noop on Firefox MV2 ---
+// Rationale: Firefox uses persistent background scripts; Chrome MV3 uses
+// ephemeral service workers that may suspend with queued work (#5).
+// We gate the alarm on MV3 to avoid unnecessary wakeups on Firefox.
+// Requires "alarms" permission in manifest (both MV2/MV3).
+const manifestVersion = (() => {
+  try { return chrome?.runtime?.getManifest?.().manifest_version ?? 2; }
+  catch { return 2; }
+})();
+const isMV3 = manifestVersion === 3;
 
+// Cross-browser alarms handle (Chrome or Firefox)
+const alarmsApi = (chrome as any)?.alarms ?? (globalThis as any).browser?.alarms;
+
+const QUEUE_ALARM_NAME = 'queueTick';
+const QUEUE_ALARM_PERIOD_MIN = 1;
+
+function ensureQueueAlarm() {
+  if (!alarmsApi) return;
+  try {
+    // Re-creating with the same name overwrites the old one; idempotent.
+    alarmsApi.create?.(QUEUE_ALARM_NAME, { periodInMinutes: QUEUE_ALARM_PERIOD_MIN });
+  } catch (e) {
+    try { log('warn', `[alarms] failed to create ${QUEUE_ALARM_NAME}: ${errToStr(e)}`); } catch {}
+    try { persistLogsSoon(); } catch {}
+  }
+}
+
+// Wake the queue on each tick.
+alarmsApi?.onAlarm?.addListener?.((a: any) => {
+  if (a?.name === QUEUE_ALARM_NAME) {
+    // Fire-and-forget to avoid blocking the alarm thread.
+    try { void (processQueue as any)?.(); } catch {}
+  }
+});
+
+// Set up only for Chrome MV3 service workers.
+if (isMV3) {
+  ensureQueueAlarm();
+  chrome.runtime?.onInstalled?.addListener?.(() => ensureQueueAlarm());
+  chrome.runtime?.onStartup?.addListener?.(() => ensureQueueAlarm());
+}
 
 void init();

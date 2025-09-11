@@ -10,7 +10,8 @@
   "permissions": [
     "storage",
     "tabs",
-    "webNavigation"
+    "webNavigation",
+    "alarms"
   ],
   "content_scripts": [
     {
