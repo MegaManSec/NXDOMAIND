@@ -1,7 +1,7 @@
 {
   "name": "NXDOMAIND",
   "description": "Watch browser network traffic for domains, and check whether they're unregistered.",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "private": false,
   "type": "module",
   "scripts": {
