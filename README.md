@@ -21,6 +21,14 @@ The best part? One codebase, two builds!
 - **Chrome (MV3)**: service worker (ESM)
 - **Firefox (MV2)**: background script (IIFE)
 
+## What it actually does
+- Monitors all network requests, and extracts all connected-to ICANN-only **domain** (using the [PSL](https://publicsuffix.org/) with [tldts](https://www.npmjs.com/package/tldts)).
+- Uses either **RDAP** or **DNS-over-HTTPS** to check if the domain is actually registered, or it's an unregistered, dangling domain.
+- Records the **page URL** (where the request was initiated from) and the **full request URL** (where the request was supposed to be made to).
+- The extension badge turns **red** on new finding; **blue** when idle; and **yellow** while checking new domains.
+
+The idea is that there some websites attempting to load resources from external domains which no longer exist. You can register them, and take advantage of how the external resource is being loaded.
+
 ## Download
 
 Packed Chrome and Firefox extensions can be downloaded from the [releases](https://github.com/MegaManSec/NXDOMAIND/releases) page.
@@ -44,12 +52,6 @@ pnpm run build
 ### Load
 - **Chrome**: `chrome://extensions` → Developer mode → Load unpacked → `dist/chrome`
 - **Firefox**: `about:debugging` → This Firefox → Load Temporary Add-on → `dist/firefox/manifest.json`
-
-## What it actually does
-- Monitors all network requests, and extracts ICANN-only **domain** (using the [PSL](https://publicsuffix.org/) with [tldts](https://www.npmjs.com/package/tldts)).
-- Uses **RDAP** to check if the domain is registered, or falls back to a DNS-only check for TLDs with no RDAP, decreasing candidates (a.b.example.com -> b.example.com -> example.com), checking for **A/AAAA/TXT/NS** via dns.google.
-- Records **page URL** (where seen) and **full request URL** (what was fetched or blocked).
-- Badge turns **red** on new finding; turns **blue** when popup opens; turns **yellow** while checking new domains.
 
 # Tuning
 Edit `src/background.ts`:
