@@ -1,7 +1,9 @@
 import { parse } from 'tldts';
 
 type Method = 'rdap' | 'dns' | null;
-type Status = 'registered' | 'unregistered' | 'unknown' | 'error' | 'cors_error' | 'pending';
+type StatusPublic = 'registered' | 'unregistered' | 'unknown';
+type StatusInternal = StatusPublic | 'pending' | 'error';
+type Status = StatusInternal;
 
 interface PageRef { url: string; ts: number; }
 
@@ -20,7 +22,7 @@ const MAX_HOSTS = 1_000_000; // Total maximum *hosts* (subdomain.domain.com) kep
 const MAX_PAGES_PER_DOMAIN = 200; // Total maximum "Pages observed on:" (https://html-viewer.com/)
 const MAX_REQS_PER_DOMAIN  = 200; // Total maximum "Requests made to this domain:" (https://example.com/page1, https://example.com/page2)
 
-const REQ_GC_WINDOW_MS = 60_000; // GC seen requestIds
+const REQ_GC_WINDOW_MS = 30_000; // GC seen requestIds
 const REQ_TTL_MS = 1_500;        // suppress duplicate events for same requestId
 const MAX_CONCURRENCY = 10;
 
@@ -238,20 +240,6 @@ function pageFromVerbose(details:any, tabId?:number, frameId?:number){
     persistLogsSoon();
   }
   return { url, source };
-}
-
-function candidatesFrom(originalHost: string, registrable: string | null): string[] {
-  if (!registrable) return [];
-  const labels = originalHost.split('.').filter(Boolean);
-  const regLabels = registrable.split('.');
-  // If host doesn't end with registrable (edge), just return registrable
-  if (labels.slice(-regLabels.length).join('.') !== registrable) return [registrable];
-  const out: string[] = [registrable];
-  // Add longer host suffixes above registrable (shortest -> longest)
-  for (let i = labels.length - regLabels.length - 1; i >= 0; i--) {
-    out.push(labels.slice(i).join('.'));
-  }
-  return out;
 }
 
 const ICONS = {
@@ -495,63 +483,54 @@ async function doh(name: string, type: string){
 
 async function dnsCheckOne(name: string){
   try {
-    log('debug', `[doh] check ${name}`);
-    const [a, aaaa, txt, ns] = await Promise.all([
-      doh(name, "A"),
-      doh(name, "AAAA"),
-      doh(name, "TXT"),
-      doh(name, "NS")
-    ]);
+    log('debug', `[doh] check ${name} (NS only)`);
+    const ns = await doh(name, "NS");
+    const code = (j: any) => (j && typeof j.Status === 'number' ? j.Status : -1);
+    const rcode = code(ns);
+    const hasNS  = ns && ns.Status === 0 && Array.isArray(ns.Answer) && ns.Answer.length > 0;
+    const hasSOA = Array.isArray(ns?.Authority) && ns.Authority.some((rr: any) => rr.type === 6);
 
-    const hasAnswer = (j: any) => j && j.Status === 0 && Array.isArray(j.Answer) && j.Answer.length > 0;
-    const isNx      = (j: any) => j && j.Status === 3;
-    const code      = (j: any) => (j && typeof j.Status === 'number' ? j.Status : -1);
-    const isSoft    = (j: any) => [2,5].includes(code(j)); // SERVFAIL, REFUSED
-
-    // If any resolver came back with a transient condition, soft-fail.
-    if ([a, aaaa, txt, ns].some(isSoft)) {
-      log('debug', `[doh] ${name} -> registered`);
-      return { status: 'registered' as Status, method: 'dns' as Method };
-/*
-      log('warn', `[doh] ${name} -> SERVFAIL/REFUSED; soft-fail as 'unknown'`);
-      return { status: 'unknown' as Status, method: 'dns' as Method };
-*/
+    if (rcode === 3) { // NXDOMAIN
+      log('debug', `[doh] ${name} -> unregistered (NXDOMAIN)`);
+      return { status: 'unregistered' as Status, method: 'dns' as Method };
     }
 
+    if (rcode === 0) { // NOERROR
+      if (hasNS || hasSOA) {
+        log('debug', `[doh] ${name} -> registered (NS/SOA present)`);
+        return { status: 'registered' as Status, method: 'dns' as Method };
+      }
+    }
 
-    const anyAns = hasAnswer(a) || hasAnswer(aaaa) || hasAnswer(txt) || hasAnswer(ns);
-    const nxAll  = isNx(a) && isNx(aaaa) && isNx(txt) && isNx(ns);
+    // count unknown code as 'registered', to avoid retrying every single time we see the domain
+    log('debug', `[doh] ${name} -> unknown (rcode=${rcode} transient)`);
+    return { status: 'registered' as Status, method: 'dns' as Method };
 
-    const res = anyAns ? 'registered' : nxAll ? 'unregistered' : 'unknown';
-    log('debug', `[doh] ${name} -> ${res}`);
-    return { status: res as Status, method: 'dns' as Method };
   } catch (e) {
-    // Network/timeout/etc → SOFT FAIL
+    // Network/timeout/etc
     log('warn', `[doh] ${name} transient failure: ${errToStr(e)}; soft-fail as 'unknown'`);
     persistLogsSoon();
     return { status: 'unknown' as Status, method: 'dns' as Method };
   }
 }
 
-async function dnsFallback(originalHost: string, registrable: string){
-  log('debug', `[doh] fallback for host=${originalHost} registrable=${registrable}`);
-  const cands = candidatesFrom(originalHost, registrable);
-  let last = { status: 'unknown' as Status, method: 'dns' as Method };
-  for (const cand of cands){
-    const cs = domainStatus[cand];
-    if (cs && (cs.status === 'registered' || cs.status === 'unregistered')){
-      log('debug', `[doh] cache-hit ${cand} -> ${cs.status}`);
-      return { result: { status: cs.status, method: cs.method, http: cs.http ?? 0, url: cs.url ?? "" }, cands };
-    }
-    const res = await dnsCheckOne(cand);
-    log('debug', `[doh] checked ${cand} -> ${res.status}`);
-    if (res.status === 'registered'){
-      return { result: { status: res.status, method: res.method, http: 0, url: "" }, cands };
-    }
-    last = res;
+async function dnsFallback(registrable: string){
+  log('debug', `[doh] fallback registrable=${registrable}`);
+  const cands = [registrable]; // no subdomain looping
+
+  // Cache check
+  const cs = domainStatus[registrable];
+  if (cs && (cs.status === 'registered' || cs.status === 'unregistered')) {
+    log('debug', `[doh] cache-hit ${registrable} -> ${cs.status}`);
+    return { result: { status: cs.status, method: cs.method, http: cs.http ?? 0, url: cs.url ?? "" }, cands };
   }
-  return { result: { status: last.status, method: last.method, http: 0, url: "" }, cands };
+
+  // Single DNS check at registrable
+  const res = await dnsCheckOne(registrable);
+  log('debug', `[doh] checked ${registrable} -> ${res.status}`);
+  return { result: { status: res.status, method: res.method, http: 0, url: "" }, cands };
 }
+
 
 function addPageContext(domain: string, pageUrl?: string | null){
   if (!pageUrl) return;
@@ -680,12 +659,12 @@ function enqueue(regDomain: string){
   void processQueue();
 }
 
-async function checkRegistrable(registrable: string, originalHost: string){
-  log('debug', `[check] registrable=${registrable} fromHost=${originalHost}`);
+async function checkRegistrable(registrable: string){
+  log('debug', `[check] registrable=${registrable}`);
   const resp = await rdapFetch(registrable);
 
   if (resp.ok && resp.status === 200){
-    const cands = candidatesFrom(originalHost, registrable);
+    const cands = [registrable];
     const result: DomainInfo = { status: 'registered', method: 'rdap', http: 200, url: resp.finalUrl, ts: now() };
     propagateStatus(cands, result);
     log('debug', `[check] ${registrable} -> registered (rdap 200)`);
@@ -693,32 +672,36 @@ async function checkRegistrable(registrable: string, originalHost: string){
   }
 
   if (!resp.ok && resp.status === 404){
-    const noRedirect = resp.finalUrl.startsWith("https://rdap.org/");
-    const cands = candidatesFrom(originalHost, registrable);
-    if (!noRedirect){
+    const cands = [registrable];
+    // If rdap.org redirected us to an authoritative RDAP endpoint,
+    // a 404 there is strong evidence of "unregistered".
+    const redirectedOffAggregator = !resp.finalUrl.startsWith("https://rdap.org/");
+    if (redirectedOffAggregator) {
       const result: DomainInfo = { status: 'unregistered', method: 'rdap', http: 404, url: resp.finalUrl, ts: now() };
       propagateStatus(cands, result);
       log('debug', `[check] ${registrable} -> unregistered (rdap 404 via redirect)`);
       return;
     }
-    const { result } = await dnsFallback(originalHost, registrable);
-    if (result.status === 'registered' || result.status === 'unregistered') {
-      propagateStatus(cands, { ...result, http: result.http ?? 0, url: result.url ?? '', ts: now() });
-      log('debug', `[check] ${registrable} -> ${result.status} (dns fallback)`);
-    } else {
-      // SOFT FAIL: keep pending so it retries on the next signal
-      log('warn', `[check] ${registrable} dns fallback inconclusive (${result.status}); keeping 'pending'`);
-      delete lastQueued[registrable]; // remove 30s throttle for quick retry
-    }
+    // Otherwise confirm with DNS before committing.
+    try {
+      const { result } = await dnsFallback(registrable);
+      if (result.status === 'registered' || result.status === 'unregistered') {
+        propagateStatus(cands, { ...result, http: result.http ?? 0, url: result.url ?? '', ts: now() });
+        log('debug', `[check] ${registrable} -> ${result.status} (dns fallback after rdap 404 on aggregator)`);
+        return;
+      }
+    } catch {}
+    log('warn', `[check] ${registrable} rdap 404 on aggregator; DNS inconclusive -> keeping 'pending'`);
+    delete lastQueued[registrable];
     return;
   }
 
   if (!resp.ok && resp.status === 0){
-    const cands = candidatesFrom(originalHost, registrable);
+    const cands = [registrable];
 
     // Try DNS as a best-effort fallback first
     try {
-      const { result } = await dnsFallback(originalHost, registrable);
+      const { result } = await dnsFallback(registrable);
       if (result.status === 'registered' || result.status === 'unregistered') {
         // We got a definitive answer from DNS - commit it.
         propagateStatus(cands, { ...result, http: result.http ?? 0, url: result.url ?? '', ts: now() });
@@ -736,7 +719,7 @@ async function checkRegistrable(registrable: string, originalHost: string){
     return;
   }
 
-  const cands = candidatesFrom(originalHost, registrable);
+  const cands = [registrable];
   const result: DomainInfo = { status: 'error', method: 'rdap', http: resp.status, url: resp.finalUrl, ts: now() };
   propagateStatus(cands, result);
   log('debug', `[check] ${registrable} -> error http=${resp.status}`);
@@ -749,15 +732,14 @@ async function processQueue(){
     void updateBadge();
     log('debug', `[process] start ${item} inflight=${inflight} remaining=${queue.length}`);
     try {
-      const originalHost = itemToHost.get(item) || item;
-      await checkRegistrable(item, originalHost);
+      await checkRegistrable(item);
       log('debug', `[process] done  ${item}`);
     } catch (e) {
       log('error', `[process] ${item} failed: ${errToStr(e)}`);
       persistLogsSoon();
     } finally {
       active.delete(item);
-      inflight--;
+      inflight = Math.max(0, inflight - 1);
       if (queue.length) setTimeout(() => { void processQueue(); }, 0);
       persistSoon(); // batch writes under load
       void updateBadge();
@@ -908,9 +890,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   if (msg?.type === "getState"){
     // Return authoritative in-memory state; don't overwrite it from storage here.
+    console.log(domainStatus);
     sendResponse({
       availableList,
-      cacheSize: Object.keys(domainStatus).length,
+      cacheSize: Object.keys(domainStatus).length, // XXX; includes 'pending'
       hostsSeen: Object.keys(hostSeen).length
     });
     return true;
@@ -920,7 +903,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     hostSeen = {};
     domainStatus = {};
     queue = [];
-    inflight = 0;
     try { (active as any).clear?.(); } catch (e) { log('error', 'clearCache active.clear failed: ' + errToStr(e)); persistLogsSoon(); }
     for (const k of Object.keys(lastQueued)) delete lastQueued[k];
     try { (itemToHost as any).clear?.(); } catch (e) { log('error', 'clearCache itemToHost.clear failed: ' + errToStr(e)); persistLogsSoon(); }
@@ -1006,20 +988,21 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
-  if (msg?.type === "recheckDomain" && typeof msg.domain === "string"){
-    const d = normalizeHost(msg.domain);
-    if (d){
-      delete domainStatus[d];
-      delete lastQueued[d];
-      const host = itemToHost.get(d) || d;
-      ensureEnqueued(d, host, 'recheck');
+  if (msg?.type === "recheckDomain" && typeof msg.domain === "string") {
+    const host = normalizeHost(msg.domain);
+    const info = host ? parse(host) : null;
+    const registrable = (info && info.domain && info.isIcann && !info.isIp) ? info.domain : null;
+    if (registrable) {
+      delete domainStatus[registrable];
+      delete lastQueued[registrable];
+      const hostHint = itemToHost.get(registrable) || host || registrable;
+      ensureEnqueued(registrable, hostHint, 'recheck');
       sendResponse({ ok: true });
     } else {
       sendResponse({ ok: false });
     }
     return true;
   }
-
   return false;
 });
 
