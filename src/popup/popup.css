@@ -21,3 +21,4 @@ button:hover { background: #f0f0f0; }
 .item-actions { display: flex; gap: 6px; margin-top: 6px; }
 .item-actions button { font-size: 11px; padding: 4px 6px; }
 footer { margin-top: 10px; color: #777; font-size: 11px; }
+a { color: #777; }

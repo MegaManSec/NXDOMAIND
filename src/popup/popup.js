@@ -41,6 +41,12 @@ function sendMessageP(message) {
   });
 }
 
+// requestIdleCallback (polyfilled) to delay initial refresh until the page is idle-ish
+const rIC = window.requestIdleCallback || function(cb, opts){
+  const delay = (opts && typeof opts.timeout === 'number') ? opts.timeout : 200;
+  return setTimeout(() => cb({ didTimeout: true, timeRemaining: () => 0 }), delay);
+};
+
 async function getSafeState(){
   // Try background first (worker may be cold). A couple quick retries.
   for (let i = 0; i < 2; i++){
@@ -66,7 +72,37 @@ async function getSafeState(){
   }
 }
 
+// Update helper that avoids unnecessary text mutations (which can clear selection)
+function setTextIfChanged(el, text){
+  if (!el) return;
+  if (el.textContent !== text) el.textContent = text;
+}
+
+// return true if text is being selected in the element 'el'
+function isSelectingInside(el){
+  const sel = document.getSelection?.();
+  if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return false;
+  const a = sel.anchorNode, f = sel.focusNode;
+  return (a && el.contains(a)) || (f && el.contains(f));
+}
+
+const scheduleRefresh = (() => {
+  let id;
+  return (delay = 150) => {
+    clearTimeout(id);
+    id = setTimeout(refresh, delay);
+  };
+})();
+
 async function refresh(){
+  const listEl   = document.getElementById("list");
+  const headerEl = document.querySelector("header") || document.getElementById("header");
+
+  if ((listEl && isSelectingInside(listEl)) || (headerEl && isSelectingInside(headerEl))) {
+    scheduleRefresh(200);
+    return;
+  }
+
   const state = await getSafeState();
   const availableList = Array.isArray(state.availableList) ? state.availableList : [];
   const cacheSize = typeof state.cacheSize === 'number' ? state.cacheSize : 0;
@@ -75,11 +111,12 @@ async function refresh(){
   const ac = document.getElementById("avail-count");
   const cc = document.getElementById("cache-count");
   const hc = document.getElementById("hosts-count");
-  if (ac) ac.textContent = String(availableList.length);
-  if (cc) cc.textContent = String(cacheSize);
-  if (hc) hc.textContent = fmtNum(hostsSeen);
 
-  const ul = document.getElementById("list");
+  setTextIfChanged(ac, String((Array.isArray(state.availableList) ? state.availableList : []).length));
+  setTextIfChanged(cc, String(typeof state.cacheSize === 'number' ? state.cacheSize : 0));
+  setTextIfChanged(hc, fmtNum(typeof state.hostsSeen === 'number' ? state.hostsSeen : 0));
+
+  const ul = listEl;
   if (!ul) return;
   ul.innerHTML = "";
   availableList
@@ -143,7 +180,7 @@ async function refresh(){
       recheck.textContent = "Recheck";
       recheck.addEventListener("click", async () => {
         try { await chrome.runtime.sendMessage({ type: "recheckDomain", domain: item.domain }); } catch {}
-        setTimeout(refresh, 600);
+        scheduleRefresh(600);
       });
       actions.appendChild(recheck);
 
@@ -156,7 +193,7 @@ async function refresh(){
 try {
   chrome.runtime.onMessage.addListener((msg) => {
     if (msg && (msg.type === "stateUpdated" || msg.type === "availableListUpdated")) {
-      refresh();
+      scheduleRefresh();
     }
   });
 } catch {}
@@ -165,17 +202,16 @@ try {
 try {
   chrome.storage.onChanged.addListener((changes, area) => {
     if (area === 'local' && (changes.availableList || changes.hostSeen || changes.domainStatus)) {
-      refresh();
+      scheduleRefresh();
     }
   });
 } catch {}
 
 document.addEventListener("DOMContentLoaded", async () => {
   try { await chrome.runtime.sendMessage({ type: 'ackNew' }); } catch {}
+  // Initial refresh when the popup is idle-ish
   refresh();
-  // Stagger a couple of follow-ups in case the worker was cold
-  setTimeout(refresh, 300);
-  setTimeout(refresh, 1200);
+  rIC(() => scheduleRefresh(800), { timeout: 800 });
 });
 
 document.getElementById("copy")?.addEventListener("click", async () => {
@@ -236,13 +272,13 @@ document.getElementById("copy2")?.addEventListener("click", async () => {
 
 document.getElementById("clear")?.addEventListener("click", async () => {
   try { await chrome.runtime.sendMessage({ type: "clearAvailable" }); } catch {}
-  await refresh();
+  scheduleRefresh();
 });
 
 document.getElementById("clear-cache")?.addEventListener("click", async () => {
   if (!confirm("Clear cached domains/hosts? This will force re-checking.")) return;
   try { await chrome.runtime.sendMessage({ type: "clearCache" }); } catch {}
-  await refresh();
+  scheduleRefresh();
 });
 
 async function loadLogs() {
