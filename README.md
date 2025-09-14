@@ -22,6 +22,7 @@ The best part? One codebase, two builds!
 - **Firefox (MV2)**: background script (IIFE)
 
 ## What it actually does
+
 - Monitors all network requests, and extracts all connected-to ICANN-only **domain** (using the [PSL](https://publicsuffix.org/) with [tldts](https://www.npmjs.com/package/tldts)).
 - Uses either **RDAP** or **DNS-over-HTTPS** to check if the domain is actually registered, or it's an unregistered, dangling domain.
 - Records the **page URL** (where the request was initiated from) and the **full request URL** (where the request was supposed to be made to).
@@ -37,6 +38,7 @@ Packed Chrome and Firefox extensions can be downloaded from the [releases](https
 - Chrome: open [chrome://extensions/](chrome://extensions/), and drag the `.zip` file into your browser to import it.
 
 ## Build
+
 ```bash
 pnpm prepare
 pnpm run build:chrome
@@ -50,10 +52,12 @@ pnpm run build
 - Firefox output: `dist/firefox`
 
 ### Load
+
 - **Chrome**: `chrome://extensions` → Developer mode → Load unpacked → `dist/chrome`
 - **Firefox**: `about:debugging` → This Firefox → Load Temporary Add-on → `dist/firefox/manifest.json`
 
 ## Tuning
+
 Edit `src/background.ts`:
 
 - `MAX_DOMAINS` – max registrable domains (eTLD+1) cached.

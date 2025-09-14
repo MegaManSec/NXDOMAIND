@@ -7,21 +7,11 @@
     "32": "icons/icon32-blue.png",
     "128": "icons/icon128-blue.png"
   },
-  "permissions": [
-    "storage",
-    "tabs",
-    "webNavigation",
-    "alarms"
-  ],
+  "permissions": ["storage", "tabs", "webNavigation", "alarms"],
   "content_scripts": [
     {
-      "matches": [
-        "http://*/*",
-        "https://*/*"
-      ],
-      "js": [
-        "csp-listener.js"
-      ],
+      "matches": ["http://*/*", "https://*/*"],
+      "js": ["csp-listener.js"],
       "run_at": "document_start"
     }
   ],
