@@ -890,7 +890,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   if (msg?.type === "getState"){
     // Return authoritative in-memory state; don't overwrite it from storage here.
-    console.log(domainStatus);
     sendResponse({
       availableList,
       cacheSize: Object.keys(domainStatus).length, // XXX; includes 'pending'
