@@ -53,7 +53,7 @@ pnpm run build
 - **Chrome**: `chrome://extensions` → Developer mode → Load unpacked → `dist/chrome`
 - **Firefox**: `about:debugging` → This Firefox → Load Temporary Add-on → `dist/firefox/manifest.json`
 
-# Tuning
+## Tuning
 Edit `src/background.ts`:
 
 - `MAX_DOMAINS` – max registrable domains (eTLD+1) cached.
