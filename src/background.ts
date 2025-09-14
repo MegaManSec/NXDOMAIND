@@ -436,15 +436,15 @@ async function rdapFetch(domain: string) {
     // Primary attempt
     return await attempt(url, 5000);
   } catch (e1) {
-    log('warn', `[rdap] primary failed -> ${errToStr(e1)}; retrying`);
+    log('warn', `[rdap] primary failed -> ${errToStr(e1)}; trying secondary`);
     persistLogsSoon();
     try {
       // Single retry with a slightly longer budget
       return await attempt(url, 7000);
     } catch (e2) {
-      log('warn', `[rdap] retry failed -> ${errToStr(e2)}`);
-      persistLogsSoon();
       // Transport failure; not a domain verdict
+      log('warn', `[rdap] ${domain} transient failure: ${errToStr(e2)}; will try doh`);
+      persistLogsSoon();
       return { ok: false, status: 0, finalUrl: url };
     }
   }
@@ -530,7 +530,6 @@ async function dnsFallback(registrable: string){
   log('debug', `[doh] checked ${registrable} -> ${res.status}`);
   return { result: { status: res.status, method: res.method, http: 0, url: "" }, cands };
 }
-
 
 function addPageContext(domain: string, pageUrl?: string | null){
   if (!pageUrl) return;
@@ -636,9 +635,11 @@ function ensureEnqueued(regDomain: string, origHost: string, source: string){
   }
 
   // If already RESOLVED (not pending), skip; allow pending to enqueue
-  if (domainStatus[regDomain] && domainStatus[regDomain].status !== 'pending') {
-    log('debug', `[queue] skip-resolved ${regDomain} status=${domainStatus[regDomain].status}`);
-    return;
+  if (domainStatus[regDomain]) {
+    if (domainStatus[regDomain].status !== 'pending' && domainStatus[regDomain].status !== 'invalid') {
+      log('debug', `[queue] skip-resolved ${regDomain} status=${domainStatus[regDomain].status}`);
+      return;
+    }
   }
 
   if (active.has(regDomain)) { log('debug', `[queue] skip-active ${regDomain}`); return; }
@@ -654,7 +655,7 @@ function ensureEnqueued(regDomain: string, origHost: string, source: string){
 }
 
 function enqueue(regDomain: string){
-  if (domainStatus[regDomain] && domainStatus[regDomain].status !== 'pending') return;
+  if (domainStatus[regDomain] && !(domainStatus[regDomain].status in ['pending', 'invalid'])) return;
   if (!queue.includes(regDomain)) queue.push(regDomain);
   void processQueue();
 }
@@ -890,9 +891,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   if (msg?.type === "getState"){
     // Return authoritative in-memory state; don't overwrite it from storage here.
+    let cacheSize = 0;
+    for (const dkey of Object.keys(domainStatus)) {
+      const d = domainStatus[dkey];
+      if (d['status'] !== 'pending' && d['status'] !== 'unknown')
+        cacheSize += 1;
+    }
     sendResponse({
       availableList,
-      cacheSize: Object.keys(domainStatus).length, // XXX; includes 'pending'
+      cacheSize: cacheSize,
       hostsSeen: Object.keys(hostSeen).length
     });
     return true;
