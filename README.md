@@ -40,16 +40,24 @@ Packed Chrome and Firefox extensions can be downloaded from the [releases](https
 ## Build
 
 ```bash
-pnpm prepare
+pnpm install
 pnpm run build:chrome
 pnpm run build:firefox
 # or
-pnpm prepare
+pnpm install
 pnpm run build
 ```
 
 - Chrome output: `dist/chrome`
 - Firefox output: `dist/firefox`
+
+There's also
+
+```bash
+pnpm run typecheck
+pnpm run lint
+pnpm run fix
+```
 
 ### Load
 

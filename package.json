@@ -1,16 +1,15 @@
 {
   "name": "NXDOMAIND",
   "description": "Watch browser network traffic for domains, and check whether they're unregistered.",
-  "version": "1.0.5",
+  "version": "1.0.6",
   "private": false,
   "type": "module",
   "scripts": {
-    "prepare": "pnpm install --lockfile-only",
-    "install": "pnpm install --lockfile-only",
+    "preinstall": "npx -y only-allow pnpm",
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "lint": "eslint \"src/*.{ts,tsx,mts,cts}\" --cache",
+    "lint": "eslint \"src/**/*.{ts,tsx,mts,cts}\" --cache",
     "format": "prettier --check .",
-    "fix": "prettier --write . && eslint \"src/*.{ts,tsx,mts,cts}\" --cache --fix && prettier --write .",
+    "fix": "eslint \"src/**/*.{ts,tsx,mts,cts}\" --cache --fix && prettier --write .",
     "prebuild": "pnpm typecheck && prettier --write .",
     "build:chrome": "node scripts/build.mjs chrome",
     "build:firefox": "node scripts/build.mjs firefox",
@@ -18,8 +17,7 @@
     "dev:chrome": "web-ext run --target=chromium --source-dir=dist/chrome",
     "dev:firefox": "web-ext run --source-dir=dist/firefox",
     "sign:firefox": "web-ext sign --source-dir=dist/firefox --artifacts-dir=artifacts/firefox --channel=unlisted",
-    "clean": "rimraf dist",
-    "preinstall": "npx -y only-allow pnpm"
+    "clean": "rimraf dist"
   },
   "repository": {
     "type": "git",

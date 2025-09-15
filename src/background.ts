@@ -143,7 +143,9 @@ function persistLogsSoon() {
   } catch {}
   persistLogsTimer = setTimeout(() => {
     pruneLogsTTL();
-    storage.set({ logs, debugEnabled });
+    void storage
+      .set({ logs, debugEnabled })
+      .catch((e) => console.error('persistLogsSoon: storage.set failed', e));
     persistLogsTimer = null as any;
   }, 150) as any;
 }
@@ -1202,14 +1204,18 @@ chrome.runtime.onMessage.addListener(
 
     if (msg?.type === 'setDebug') {
       debugEnabled = !!msg.enabled;
-      storage.set({ debugEnabled });
+      void storage
+        .set({ debugEnabled })
+        .catch((e) => log('error', 'setDebug storage.set failed: ' + errToStr(e)));
       sendResponse({ ok: true, debugEnabled });
       return true;
     }
 
     if (msg?.type === 'clearLogs') {
       logs = [];
-      storage.set({ logs });
+      void storage
+        .set({ logs })
+        .catch((e) => log('error', 'clearLogs storage.set failed: ' + errToStr(e)));
       sendResponse({ ok: true });
       return true;
     }
@@ -1253,19 +1259,28 @@ chrome.runtime.onMessage.addListener(
         log('error', 'clearCache itemToHost.clear failed: ' + errToStr(e));
         persistLogsSoon();
       }
-      storage.set({ hostSeen, domainStatus });
-      (async () => {
-        await persist();
-        sendResponse({ ok: true });
-      })();
+      void storage
+        .set({ hostSeen, domainStatus })
+        .catch((e) => log('error', 'clearCache storage.set failed: ' + errToStr(e)));
+      void persist()
+        .then(() => {
+          sendResponse({ ok: true });
+        })
+        .catch((e) => {
+          log('error', 'persist failed: ' + errToStr(e));
+          sendResponse({ ok: false });
+        });
       return true;
     }
 
     if (msg?.type === 'clearAvailable') {
       availableList = [];
-      storage.set({ availableList }).then(() => {
-        void updateBadge();
-      });
+      void storage
+        .set({ availableList })
+        .then(() => {
+          void updateBadge();
+        })
+        .catch((e) => log('error', 'clearAvailable storage.set failed: ' + errToStr(e)));
       sendResponse({ ok: true });
       return true;
     }
