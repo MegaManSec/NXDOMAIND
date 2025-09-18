@@ -1,6 +1,6 @@
 {
   "name": "NXDomain'd",
-  "version": "1.0.6",
+  "version": "1.0.7",
   "description": "Discover requests sent to unregistered domains.",
   "icons": {
     "16": "icons/icon16-blue.png",
