@@ -19,9 +19,6 @@ interface DomainInfo {
   ts: number;
   pages?: PageRef[];
   requests?: PageRef[];
-}
-
-interface DomainInfo {
   softUntil?: number;
 }
 
@@ -69,6 +66,7 @@ let availableList: {
   requests?: PageRef[];
 }[] = [];
 let queue: string[] = [];
+const queued = new Set<string>();
 let inflight = 0;
 let hasNew = false;
 let tabTopUrl: Record<number, string> = {};
@@ -500,12 +498,12 @@ function updateBadgeSoon() {
   }, delay) as any;
 }
 
-async function updateBadge() {
+function updateBadge() {
   const stop = profTic('updateBadge');
   try {
     const count = availableList.length;
     const workingNow = isWorking();
-    // skip if nothing changed
+    // Skip if nothing changed
     if (
       lastBadgeState.count === count &&
       lastBadgeState.working === workingNow &&
@@ -513,17 +511,25 @@ async function updateBadge() {
     ) {
       return;
     }
+    const prev = lastBadgeState;
     lastBadgeState = { count, working: workingNow, hasNew };
     lastBadgeAt = performance.now();
-    try {
-      await act.setBadgeText({ text: count ? String(count) : '' });
-    } catch {}
-    try {
-      await act.setBadgeBackgroundColor({ color: hasNew ? '#d93025' : '#1a73e8' });
-    } catch {}
-    try {
-      await act.setIcon({ path: workingNow ? ICONS.yellow : ICONS.blue });
-    } catch {}
+    // Only update the pieces that actually changed; fire-and-forget to avoid blocking
+    if (prev.count !== count) {
+      try {
+        void act.setBadgeText({ text: count ? String(count) : '' });
+      } catch {}
+    }
+    if (prev.hasNew !== hasNew) {
+      try {
+        void act.setBadgeBackgroundColor({ color: hasNew ? '#d93025' : '#1a73e8' });
+      } catch {}
+    }
+    if (prev.working !== workingNow) {
+      try {
+        void act.setIcon({ path: workingNow ? ICONS.yellow : ICONS.blue });
+      } catch {}
+    }
   } finally {
     stop();
   }
@@ -719,7 +725,7 @@ if (chrome.webNavigation && chrome.webNavigation.onCommitted) {
         'debug',
         `[signal:webNavigation.onCommitted] tab=${details.tabId} frame=${details.frameId} url=${details.url}`,
       );
-      void persist();
+      persistSoon();
     }
   });
 }
@@ -736,7 +742,7 @@ if (chrome.webNavigation && chrome.webNavigation.onHistoryStateUpdated) {
         'debug',
         `[signal:webNavigation.onHistoryStateUpdated] tab=${details.tabId} frame=${details.frameId} url=${details.url}`,
       );
-      void persist();
+      persistSoon();
     }
   });
 }
@@ -752,7 +758,7 @@ if (chrome.webNavigation && chrome.webNavigation.onReferenceFragmentUpdated) {
         'debug',
         `[signal:webNavigation.onReferenceFragmentUpdated] tab=${details.tabId} frame=${details.frameId} url=${details.url}`,
       );
-      void persist();
+      persistSoon();
     }
   });
 }
@@ -762,7 +768,7 @@ chrome.tabs.onUpdated.addListener((tabId: number, changeInfo: { url?: string }) 
   if (changeInfo.url && /^https?:\/\//.test(changeInfo.url)) {
     recordTabTop(tabId, changeInfo.url);
     log('debug', `[signal:tabs.onUpdated] tab=${tabId} url=${changeInfo.url}`);
-    void persist();
+    persistSoon();
   }
 });
 
@@ -777,7 +783,7 @@ chrome.tabs.onRemoved.addListener((tabId: number) => {
   delete tabHistory[tabId];
   dirty.tabTopUrl = true;
   log('debug', `[signal:tabs.onRemoved] tab=${tabId}`);
-  void persist();
+  persistSoon();
 });
 
 // RDAP
@@ -1148,13 +1154,14 @@ function ensureEnqueued(regDomain: string, origHost: string, source: string) {
       log('debug', `[queue] skip-active ${regDomain}`);
       return;
     }
-    if (inflightByDomain.has(regDomain) || queue.includes(regDomain)) {
+    if (inflightByDomain.has(regDomain) || queued.has(regDomain)) {
       log('debug', `[queue] skip-inqueue ${regDomain}`);
       return;
     }
 
     itemToHost.set(regDomain, origHost);
     queue.push(regDomain);
+    queued.add(regDomain);
     lastQueued[regDomain] = t;
     log(
       'debug',
@@ -1295,6 +1302,7 @@ async function processQueue() {
     while (inflight < MAX_CONCURRENCY && queue.length) {
       const item = queue.shift()!;
       active.add(item);
+      queued.delete(item);
       inflight++;
       updateBadgeSoon();
       log('debug', `[process] start ${item} inflight=${inflight} remaining=${queue.length}`);
@@ -1358,9 +1366,6 @@ chrome.webRequest.onBeforeRequest.addListener(
         return;
       }
 
-      hostSeen[host] = now();
-      dirty.hostSeen = true;
-      persistSoon();
       const t = now();
       const prev = hostSeen[host] || 0;
       hostSeen[host] = t;
@@ -1568,6 +1573,7 @@ chrome.runtime.onMessage.addListener(
       for (const k of Object.keys(lastQueued)) {
         delete lastQueued[k];
       }
+      queued.clear();
       try {
         (itemToHost as any).clear?.();
       } catch (e) {
@@ -1736,7 +1742,7 @@ async function init() {
   logs = Array.isArray(s.logs) ? s.logs : [];
   pruneLogsTTL();
   debugEnabled = !!s.debugEnabled;
-  await updateBadge();
+  updateBadge();
   void processQueue();
 }
 

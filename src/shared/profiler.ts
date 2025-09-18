@@ -24,6 +24,10 @@ interface Bucket {
   lastReport: number; // last report timestamp (ms)
 }
 
+const NOOP: () => void = () => {
+ return;
+};
+
 class _Profiler {
   private enabled = true;
   private sampleEvery = 200;
@@ -44,13 +48,13 @@ class _Profiler {
 
   tic(label: string): () => void {
     if (!this.enabled) {
-      return () => {};
+      return NOOP;
     }
     const b = this.get(label);
     b.n++;
     // Only time every Nth call
     if (b.n % this.sampleEvery !== 0) {
-      return () => {};
+      return NOOP;
     }
     const t0 = performance.now();
     return () => {
@@ -65,10 +69,13 @@ class _Profiler {
   }
 
   wrap<T extends (...args: any[]) => any>(label: string, fn: T): T {
-    const self = this;
+    // Bind the instance method instead of aliasing `this`
+    const tic = this.tic.bind(this);
+
     return function (this: any, ...args: Parameters<T>): ReturnType<T> {
-      const stop = self.tic(label);
+      const stop = tic(label);
       try {
+        // Preserve the caller's dynamic `this`
         return fn.apply(this, args);
       } finally {
         stop();
@@ -97,7 +104,9 @@ class _Profiler {
     // Print a single, greppable line
     // PROf tag keeps it skimmable in noisy logs
     console.log(
-      `PROf ${label} n=${b.n} k=${b.k} sampleEvery=${this.sampleEvery} avgMs(sampled)=${avg.toFixed(3)} maxMs=${b.maxMs.toFixed(3)} estPerCallMs≈${estPerCall.toFixed(4)}`,
+      `PROf ${label} n=${b.n} k=${b.k} sampleEvery=${this.sampleEvery} avgMs(sampled)=${avg.toFixed(
+        3
+      )} maxMs=${b.maxMs.toFixed(3)} estPerCallMs≈${estPerCall.toFixed(4)}`
     );
     // keep max but decay totals so spikes remain visible over time
     b.totalMs *= 0.25;
