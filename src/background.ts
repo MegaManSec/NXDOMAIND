@@ -1564,6 +1564,8 @@ chrome.runtime.onMessage.addListener(
       hostSeen = {};
       domainStatus = {};
       queue = [];
+      hasNew = false;
+      updateBadgeSoon();
       try {
         (active as any).clear?.();
       } catch (e) {
@@ -1596,6 +1598,8 @@ chrome.runtime.onMessage.addListener(
 
     if (msg?.type === 'clearAvailable') {
       availableList = [];
+      hasNew = false;
+      updateBadgeSoon();
       void storage
         .set({ availableList })
         .then(() => {

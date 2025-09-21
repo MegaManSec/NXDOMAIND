@@ -25,7 +25,7 @@ interface Bucket {
 }
 
 const NOOP: () => void = () => {
- return;
+  return;
 };
 
 class _Profiler {
@@ -105,8 +105,8 @@ class _Profiler {
     // PROf tag keeps it skimmable in noisy logs
     console.log(
       `PROf ${label} n=${b.n} k=${b.k} sampleEvery=${this.sampleEvery} avgMs(sampled)=${avg.toFixed(
-        3
-      )} maxMs=${b.maxMs.toFixed(3)} estPerCallMs≈${estPerCall.toFixed(4)}`
+        3,
+      )} maxMs=${b.maxMs.toFixed(3)} estPerCallMs≈${estPerCall.toFixed(4)}`,
     );
     // keep max but decay totals so spikes remain visible over time
     b.totalMs *= 0.25;
