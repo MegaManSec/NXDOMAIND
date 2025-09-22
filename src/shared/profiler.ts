@@ -94,6 +94,7 @@ class _Profiler {
 
   private maybeReport(label: string, b: Bucket) {
     const now = performance.now();
+    if (b.lastReport !== 0 && now - b.lastReport < this.reportEveryMs) {
     if (now - b.lastReport < this.reportEveryMs) {
       return;
     }
