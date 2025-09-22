@@ -20,6 +20,8 @@ interface DomainInfo {
   pages?: PageRef[];
   requests?: PageRef[];
   softUntil?: number;
+  pagesMap?: Map<string, number>;
+  requestsMap?: Map<string, number>;
 }
 
 const HOST_SEEN_BUMP_MS = 5_000;
@@ -33,6 +35,21 @@ const MAX_REQS_PER_DOMAIN = 200; // Total maximum "Requests made to this domain:
 const REQ_GC_WINDOW_MS = 30_000; // GC seen requestIds
 const REQ_TTL_MS = 1_500; // suppress duplicate events for same requestId
 const MAX_CONCURRENCY = 10;
+
+const PERSIST_BASE_DELAY_MS = 10_000;
+function getPersistDelay() {
+  // Adaptive: under heavy load, back off to reduce churn
+  const base = PERSIST_BASE_DELAY_MS;
+  const load = Math.min(1, (inflight + queue.length) / (MAX_CONCURRENCY * 4));
+  return Math.floor(base + load * 20_000); // up to +20s under load
+}
+const HOSTSEEN_PERSIST_THROTTLE_MS = 2 * 60_000; // 2 minutes
+const HOSTSEEN_PERSIST_MIN_DELTA = 1_000; // only if many new hosts
+let lastHostSeenPersist = 0;
+let hostSeenNewSincePersist = 0;
+
+let lastPruneAt = 0;
+const PRUNE_MIN_PERIOD_MS = 30_000;
 
 // Throttle re-enqueues per registrable domain
 const ENQUEUE_TTL_MS = 10_000;
@@ -48,16 +65,50 @@ const LOG_TTL_MS = 15 * 60_000; // How long to keep logs; 15 minutes
 const inflightByDomain = new Map<string, Promise<void>>();
 
 const active = new Set<string>();
-const seenRequestIds: Record<string, number> = {};
-const lastQueued: Record<string, number> = {};
+const seenRequestIds = new Map<string, number>();
+const lastQueued = new Map<string, number>();
+interface ExpireEntry {
+  key: string;
+  ts: number;
+}
+const seenReqQueue: ExpireEntry[] = [];
+const lastQueuedQueue: ExpireEntry[] = [];
 
 // MV3 (chrome.action) vs MV2 (browserAction) wrapper
 const act = chrome.action || (chrome as any).browserAction;
 
 const itemToHost = new Map<string, string>();
 
+// Keep object mirrors for compatibility, but use Maps for fast LRU & prune
 let hostSeen: Record<string, number> = {};
 let domainStatus: Record<string, DomainInfo> = {};
+const hostSeenMem = new Map<string, number>(); // LRU by insertion
+const domainStatusMem = new Map<string, DomainInfo>(); // LRU by insertion
+
+function hsGet(k: string) {
+  return hostSeenMem.get(k) ?? hostSeen[k];
+}
+function hsBump(k: string, ts: number) {
+  if (hostSeenMem.has(k)) {
+    hostSeenMem.delete(k);
+  }
+  hostSeenMem.set(k, ts);
+  hostSeen[k] = ts; // keep mirror for existing reads
+}
+function dsGet(k: string) {
+  return domainStatusMem.get(k) ?? domainStatus[k];
+}
+function dsSet(k: string, v: DomainInfo) {
+  if (domainStatusMem.has(k)) {
+    domainStatusMem.delete(k);
+  }
+  domainStatusMem.set(k, v);
+  domainStatus[k] = v; // mirror for existing reads
+}
+function dsDelete(k: string) {
+  domainStatusMem.delete(k);
+  delete domainStatus[k];
+}
 let availableList: {
   domain: string;
   method: Method;
@@ -65,12 +116,113 @@ let availableList: {
   pages?: PageRef[];
   requests?: PageRef[];
 }[] = [];
-let queue: string[] = [];
+const availableIdx = new Map<string, number>();
+const MAX_AVAILABLE = 50_000;
+
+// Merge two PageRef lists by URL, keeping the latest ts, sorted desc, capped
+function mergeRefs(oldArr?: PageRef[], newArr?: PageRef[], cap = 200): PageRef[] {
+  const m = new Map<string, number>();
+  for (const it of oldArr ?? []) {
+    if (it?.url) {
+      m.set(it.url, Math.max(m.get(it.url) || 0, Number(it.ts) || 0));
+    }
+  }
+  for (const it of newArr ?? []) {
+    if (it?.url) {
+      m.set(it.url, Math.max(m.get(it.url) || 0, Number(it.ts) || 0));
+    }
+  }
+  return Array.from(m.entries())
+    .map(([url, ts]) => ({ url, ts }))
+    .sort((a, b) => b.ts - a.ts)
+    .slice(0, cap);
+}
+
+function upsertAvailable(item: {
+  domain: string;
+  method: Method;
+  ts: number;
+  pages?: PageRef[];
+  requests?: PageRef[];
+}) {
+  const i = availableIdx.get(item.domain);
+  if (i != null) {
+    const cur = availableList[i]!;
+    const next = {
+      domain: item.domain,
+      method: item.method ?? cur.method ?? null,
+      ts: item.ts ?? cur.ts,
+      // With exactOptionalPropertyTypes, only include when defined
+      ...((item.pages ?? cur.pages)
+        ? { pages: mergeRefs(cur.pages, item.pages, MAX_PAGES_PER_DOMAIN) }
+        : {}),
+      ...((item.requests ?? cur.requests)
+        ? { requests: mergeRefs(cur.requests, item.requests, MAX_REQS_PER_DOMAIN) }
+        : {}),
+    };
+    availableList[i] = next;
+  } else {
+    if (availableList.length >= MAX_AVAILABLE) {
+      // evict oldest (index 0); consider LRU if you prefer
+      const drop = 0;
+      availableIdx.delete(availableList[drop]!.domain);
+      availableList.splice(drop, 1);
+      // reindex: cheap if small cap; for large caps, use an LRU queue
+      availableIdx.clear();
+      for (let j = 0; j < availableList.length; j++) {
+        availableIdx.set(availableList[j]!.domain, j);
+      }
+    }
+    availableIdx.set(item.domain, availableList.length);
+    // Avoid attaching explicit undefined with exactOptionalPropertyTypes
+    const next = {
+      domain: item.domain,
+      method: item.method,
+      ts: item.ts,
+      ...(item.pages ? { pages: mergeRefs(undefined, item.pages, MAX_PAGES_PER_DOMAIN) } : {}),
+      ...(item.requests
+        ? { requests: mergeRefs(undefined, item.requests, MAX_REQS_PER_DOMAIN) }
+        : {}),
+    };
+    availableList.push(next);
+  }
+  dirty.availableList = true;
+}
+class Deque<T> {
+  private a: T[] = [];
+  private head = 0;
+  push(x: T) {
+    this.a.push(x);
+  }
+  shift(): T | undefined {
+    if (this.head >= this.a.length) {
+      return undefined;
+    }
+    const v = this.a[this.head++];
+    // occasional compaction
+    if (this.head > 1024 && this.head * 2 > this.a.length) {
+      this.a = this.a.slice(this.head);
+      this.head = 0;
+    }
+    return v;
+  }
+  get length() {
+    return this.a.length - this.head;
+  }
+  clear() {
+    this.a = [];
+    this.head = 0;
+  }
+}
+const queue = new Deque<string>();
 const queued = new Set<string>();
 let inflight = 0;
 let hasNew = false;
 let tabTopUrl: Record<number, string> = {};
 let debugEnabled = false;
+
+const TLD_CACHE_MAX = 50_000;
+const tldCache = new Map<string, ReturnType<typeof parse>>();
 
 const ICONS = {
   blue: {
@@ -104,6 +256,7 @@ const alarmsApi = (chrome as any)?.alarms ?? (globalThis as any).browser?.alarms
 const QUEUE_ALARM_NAME = 'queueTick';
 const QUEUE_ALARM_PERIOD_MIN = 1;
 
+let lastLogPrune = 0;
 let lastBadgeAt = 0;
 let lastBadgeState = {
   count: -1,
@@ -119,8 +272,37 @@ interface TabHistoryItem {
 const tabHistory: Record<number, TabHistoryItem[]> = {};
 const frameHistory: Record<string, TabHistoryItem[]> = {};
 
-let logs: { ts: number; level: 'debug' | 'info' | 'warn' | 'error'; msg: string }[] = [];
-
+interface LogEntry {
+  ts: number;
+  level: 'debug' | 'info' | 'warn' | 'error';
+  msg: string;
+}
+let logsBuf: (LogEntry | undefined)[] = new Array(MAX_LOGS);
+let logsHead = 0; // index of oldest
+let logsSize = 0;
+function logsPush(entry: LogEntry) {
+  const pos = (logsHead + logsSize) % MAX_LOGS;
+  logsBuf[pos] = entry;
+  if (logsSize < MAX_LOGS) {
+    logsSize++;
+  } else {
+    logsHead = (logsHead + 1) % MAX_LOGS;
+  }
+}
+function logsToArray(): LogEntry[] {
+  const out: LogEntry[] = [];
+  for (let i = 0; i < logsSize; i++) {
+    out.push(logsBuf[(logsHead + i) % MAX_LOGS]!);
+  }
+  return out;
+}
+function logsClear() {
+  logsBuf = new Array(MAX_LOGS);
+  logsHead = 0;
+  logsSize = 0;
+}
+// Count of resolved entries (not 'pending' and not 'unknown')
+let cacheResolvedCount = 0;
 type PageSource =
   | 'documentUrl'
   | 'originUrl'
@@ -159,9 +341,34 @@ async function persistSelective() {
   try {
     const payload: Record<string, unknown> = {};
     if (dirty.hostSeen) {
-      payload.hostSeen = hostSeen;
+      const now = Date.now();
+      if (
+        now - lastHostSeenPersist >= HOSTSEEN_PERSIST_THROTTLE_MS &&
+        hostSeenNewSincePersist >= HOSTSEEN_PERSIST_MIN_DELTA
+      ) {
+        payload.hostSeen = hostSeen; // snapshot mirror
+        lastHostSeenPersist = now;
+        hostSeenNewSincePersist = 0;
+      }
     }
     if (dirty.domainStatus) {
+      // materialize maps to arrays before persisting
+      for (const [k, ds] of domainStatusMem) {
+        if (ds.pagesMap) {
+          ds.pages = Array.from(ds.pagesMap.entries())
+            .map(([url, ts]) => ({ url, ts }))
+            .sort((a, b) => b.ts - a.ts)
+            .slice(0, MAX_PAGES_PER_DOMAIN);
+        }
+        if (ds.requestsMap) {
+          ds.requests = Array.from(ds.requestsMap.entries())
+            .map(([url, ts]) => ({ url, ts }))
+            .sort((a, b) => b.ts - a.ts)
+            .slice(0, MAX_REQS_PER_DOMAIN);
+        }
+        // keep object mirror in sync
+        domainStatus[k] = ds;
+      }
       payload.domainStatus = domainStatus;
     }
     if (dirty.availableList) {
@@ -172,7 +379,7 @@ async function persistSelective() {
     }
     if (dirty.logs) {
       pruneLogsTTL();
-      payload.logs = logs;
+      payload.logs = logsToArray();
       payload.debugEnabled = debugEnabled;
     }
     if (Object.keys(payload).length === 0) {
@@ -207,6 +414,25 @@ const storage = {
     ),
 };
 
+function parseHostCached(host: string): ReturnType<typeof parse> {
+  const hit = tldCache.get(host);
+  if (hit) {
+    // refresh LRU: move to the end by re-set
+    tldCache.delete(host);
+    tldCache.set(host, hit);
+    return hit;
+  }
+  const val = parse(host);
+  tldCache.set(host, val);
+  if (tldCache.size > TLD_CACHE_MAX) {
+    const firstKey = tldCache.keys().next().value;
+    if (firstKey !== undefined) {
+      tldCache.delete(firstKey);
+    }
+  }
+  return val;
+}
+
 function log(level: 'debug' | 'info' | 'warn' | 'error', msg: string) {
   const stop = profTic('log');
   try {
@@ -214,12 +440,13 @@ function log(level: 'debug' | 'info' | 'warn' | 'error', msg: string) {
       return;
     }
     try {
-      const entry = { ts: Date.now(), level, msg: String(msg) };
-      logs.push(entry);
-      pruneLogsTTL();
-      (console[level] || console.log)(
-        `[${new Date(entry.ts).toISOString()}] [${entry.level}] ${entry.msg}`,
-      );
+      const entry: LogEntry = { ts: Date.now(), level, msg: String(msg) };
+      logsPush(entry);
+      const t = Date.now();
+      if (t - lastLogPrune > 5000) {
+        pruneLogsTTL(t);
+        lastLogPrune = t;
+      }
     } catch (e) {
       try {
         console.error('log() failure:', e);
@@ -235,11 +462,11 @@ function pruneLogsTTL(nowTs = Date.now()) {
 
   try {
     const cutoff = nowTs - LOG_TTL_MS;
-    // keep only recent logs
-    logs = logs.filter((l) => l && typeof l.ts === 'number' && l.ts >= cutoff);
-    // and still respect MAX_LOGS (most recent)
-    if (logs.length > MAX_LOGS) {
-      logs.splice(0, logs.length - MAX_LOGS);
+    // TTL prune by scanning ring (bounded by MAX_LOGS)
+    const arr = logsToArray().filter((l) => l && l.ts >= cutoff);
+    logsClear();
+    for (const e of arr) {
+      logsPush(e);
     }
   } finally {
     stop();
@@ -276,10 +503,6 @@ function persistLogsSoon() {
   }
 }
 
-function now() {
-  return Date.now();
-}
-
 function normalizeHost(h?: string | null) {
   if (!h) {
     return null;
@@ -292,6 +515,16 @@ function isWorking() {
   return inflight > 0 || queue.length > 0 || active.size > 0;
 }
 
+function gcExpiring(map: Map<string, number>, q: ExpireEntry[], nowTs: number, ttl: number) {
+  while (q.length && nowTs - q[0]!.ts > ttl) {
+    const { key } = q.shift()!;
+    const cur = map.get(key);
+    if (cur != null && nowTs - cur > ttl) {
+      map.delete(key);
+    }
+  }
+}
+
 /** Keep a small, fresh history of top-level URLs per tab, and mirror to tabTopUrl. */
 function recordTabTop(tabId: number, url: string) {
   const stop = profTic('recordTabTop');
@@ -302,7 +535,7 @@ function recordTabTop(tabId: number, url: string) {
     tabTopUrl[tabId] = url;
     dirty.tabTopUrl = true;
     const arr = (tabHistory[tabId] ??= []);
-    const t = now();
+    const t = Date.now();
     arr.push({ url, ts: t });
     // prune by size and TTL
     while (arr.length > TAB_HISTORY_MAX) {
@@ -329,7 +562,7 @@ function recordFrameUrl(tabId: number, frameId: number, url: string) {
     }
     const key = `${tabId}:${frameId}`;
     const arr = (frameHistory[key] ??= []);
-    const t = now();
+    const t = Date.now();
     arr.push({ url, ts: t });
     // prune by size and TTL
     while (arr.length > TAB_HISTORY_MAX) {
@@ -406,6 +639,23 @@ function pageFromVerbose(details: any, tabId?: number, frameId?: number) {
   try {
     let url: string | undefined;
     let source: PageSource = 'none';
+    const urlCache = new Map<string, URL>();
+    const asURL = (u?: string) => {
+      if (!u) {
+        return undefined;
+      }
+      const hit = urlCache.get(u);
+      if (hit) {
+        return hit;
+      }
+      try {
+        const parsed = new URL(u);
+        urlCache.set(u, parsed);
+        return parsed;
+      } catch {
+        return undefined;
+      }
+    };
     try {
       // Prefer frame history *first*
       if (typeof tabId === 'number' && typeof frameId === 'number') {
@@ -431,17 +681,9 @@ function pageFromVerbose(details: any, tabId?: number, frameId?: number) {
       }
 
       const onlyOrigin = (() => {
-        if (!url) {
-          return false;
-        }
-        try {
-          const u = new URL(url);
-          return u.pathname === '/' && !u.search && !u.hash;
-        } catch {
-          return false;
-        }
+        const u = asURL(url);
+        return !!u && u.pathname === '/' && !u.search && !u.hash;
       })();
-
       if (typeof tabId === 'number') {
         // If we only have an origin or nothing, try recent history for this tab
         if (!url) {
@@ -452,7 +694,8 @@ function pageFromVerbose(details: any, tabId?: number, frameId?: number) {
           }
         } else if (onlyOrigin) {
           try {
-            const origin = new URL(url).origin;
+            const uo = asURL(url);
+            const origin = uo ? uo.origin : undefined;
             // Prefer a frame-scoped upgrade when possible
             if (typeof frameId === 'number') {
               const fh2 = lookupFrameHistory(tabId, frameId, origin);
@@ -491,7 +734,7 @@ function updateBadgeSoon() {
   if (badgeTimer) {
     return;
   }
-  const delay = Math.max(0, 1000 - (performance.now() - lastBadgeAt));
+  const delay = Math.max(0, 1000 - (Date.now() - lastBadgeAt));
   badgeTimer = setTimeout(() => {
     badgeTimer = null as any;
     void updateBadge();
@@ -513,7 +756,7 @@ function updateBadge() {
     }
     const prev = lastBadgeState;
     lastBadgeState = { count, working: workingNow, hasNew };
-    lastBadgeAt = performance.now();
+    lastBadgeAt = Date.now();
     // Only update the pieces that actually changed; fire-and-forget to avoid blocking
     if (prev.count !== count) {
       try {
@@ -538,53 +781,39 @@ function updateBadge() {
 function prune() {
   const stop = profTic('prune');
   try {
-    const nowTs = now();
+    const nowTs = Date.now();
     // Enforce log TTL during general housekeeping
     pruneLogsTTL(nowTs);
 
     let modifiedDomainStatus = false,
       modifiedHostSeen = false,
       modifiedAvailable = false;
-    // GC request ids
-    for (const k of Object.keys(seenRequestIds)) {
-      const v = seenRequestIds[k];
-      if (v != null && nowTs - v > REQ_GC_WINDOW_MS) {
-        delete seenRequestIds[k];
-      }
-    }
-    // GC lastQueued throttle map
-    for (const k of Object.keys(lastQueued)) {
-      const v = lastQueued[k];
-      if (v != null && nowTs - v > REQ_GC_WINDOW_MS) {
-        delete lastQueued[k];
-      }
-    }
+    gcExpiring(seenRequestIds, seenReqQueue, nowTs, REQ_GC_WINDOW_MS);
+    gcExpiring(lastQueued, lastQueuedQueue, nowTs, REQ_GC_WINDOW_MS);
 
-    // Bound domainStatus size
-    const dk = Object.keys(domainStatus);
-    if (dk.length > MAX_DOMAINS) {
-      const del = dk.length - MAX_DOMAINS;
-      dk.sort((a, b) => (domainStatus[a]?.ts ?? 0) - (domainStatus[b]?.ts ?? 0));
-      for (let i = 0; i < del; i++) {
-        delete domainStatus[dk[i]!];
-        modifiedDomainStatus = true;
+    // Bound domainStatus size via LRU
+    while (domainStatusMem.size > MAX_DOMAINS) {
+      const oldest = domainStatusMem.keys().next().value;
+      if (!oldest) {
+        break;
       }
+      dsDelete(oldest);
+      modifiedDomainStatus = true;
     }
-
-    // Bound hostSeen size
-    const hk = Object.keys(hostSeen);
-    if (hk.length > MAX_HOSTS) {
-      const delH = hk.length - MAX_HOSTS;
-      hk.sort((a, b) => (hostSeen[a] ?? 0) - (hostSeen[b] ?? 0));
-      for (let i = 0; i < delH; i++) {
-        delete hostSeen[hk[i]!];
-        modifiedHostSeen = true;
+    // Bound hostSeen size via LRU
+    while (hostSeenMem.size > MAX_HOSTS) {
+      const oldest = hostSeenMem.keys().next().value;
+      if (!oldest) {
+        break;
       }
+      hostSeenMem.delete(oldest);
+      delete hostSeen[oldest];
+      modifiedHostSeen = true;
     }
 
     // Clamp pages/requests per domain
     for (const d of Object.keys(domainStatus)) {
-      const ds = domainStatus[d];
+      const ds = dsGet(d);
       if (!ds) {
         continue;
       } // for noUncheckedIndexedAccess
@@ -662,7 +891,11 @@ function prune() {
 async function persist() {
   const stop = profTic('persist');
   try {
-    prune();
+    const t = Date.now();
+    if (t - lastPruneAt >= PRUNE_MIN_PERIOD_MS) {
+      prune();
+      lastPruneAt = t;
+    }
     await persistSelective();
     updateBadgeSoon();
   } finally {
@@ -673,8 +906,8 @@ async function persist() {
 function persistSoon() {
   const stop = profTic('persistSoon');
   try {
-    // debounce: 1500ms (tune 1000–2000) + min-spacing 500ms between requests
-    const now = performance.now();
+    // min-spacing 500ms between requests
+    const now = Date.now();
     if (now - lastPersistRequestedAt < 500 && persistScheduled) {
       return;
     }
@@ -682,7 +915,7 @@ function persistSoon() {
     if (persistTimer) {
       clearTimeout(persistTimer as any);
     }
-    persistTimer = setTimeout(triggerPersist, 1500) as any;
+    persistTimer = setTimeout(triggerPersist, getPersistDelay()) as any;
     persistScheduled = true;
   } finally {
     stop();
@@ -903,7 +1136,7 @@ async function dnsCheckOne(name: string) {
       return {
         status: 'registered' as Status,
         method: 'dns' as Method,
-        softUntil: now() + DNS_REGISTERED_SOFT_TTL_MS,
+        softUntil: Date.now() + DNS_REGISTERED_SOFT_TTL_MS,
       };
     } catch (e) {
       // Network/timeout/etc
@@ -956,31 +1189,32 @@ function addPageContext(domain: string, pageUrl?: string | null) {
     if (!pageUrl) {
       return;
     }
-    const item: DomainInfo = domainStatus[domain] ?? {
+    const item: DomainInfo = dsGet(domain) ?? {
       status: 'pending',
       method: null,
       http: 0,
       url: '',
-      ts: now(),
+      ts: Date.now(),
       pages: [],
       requests: [],
     };
-
-    item.pages = item.pages ?? [];
-    const idx = item.pages.findIndex((p) => p.url === pageUrl);
-    if (idx >= 0 && item.pages[idx]) {
-      item.pages[idx].ts = now();
-    } else {
-      item.pages.push({ url: pageUrl, ts: now() });
-      if (item.pages.length > MAX_PAGES_PER_DOMAIN) {
-        item.pages.sort((a, b) => b.ts - a.ts);
-        item.pages = item.pages.slice(0, MAX_PAGES_PER_DOMAIN);
-      }
-    }
-    item.ts = now();
-    domainStatus[domain] = item;
+    const t = Date.now();
+    item.pagesMap ??= new Map<string, number>();
+    item.pagesMap.set(pageUrl, t);
+    item.ts = t;
+    dsSet(domain, item);
     dirty.domainStatus = true;
     log('debug', `[context] page + ${pageUrl} -> ${domain} (pages=${item.pages?.length ?? 0})`);
+    // If we've already resolved this registrable as UNREGISTERED, reflect the new context immediately
+    if (item.status === 'unregistered') {
+      upsertAvailable({
+        domain,
+        method: item.method ?? null,
+        ts: item.ts,
+        pages: [{ url: pageUrl, ts: t }],
+      });
+      persistSoon();
+    }
   } finally {
     stop();
   }
@@ -992,30 +1226,32 @@ function addRequestContext(domain: string, reqUrl?: string | null) {
     if (!reqUrl) {
       return;
     }
-    const item: DomainInfo = domainStatus[domain] ?? {
+    const item: DomainInfo = dsGet(domain) ?? {
       status: 'pending',
       method: null,
       http: 0,
       url: '',
-      ts: now(),
+      ts: Date.now(),
       pages: [],
       requests: [],
     };
-    item.requests = item.requests ?? [];
-    const idx = item.requests.findIndex((p) => p.url === reqUrl);
-    if (idx >= 0 && item.requests[idx]) {
-      item.requests[idx].ts = now();
-    } else {
-      item.requests.push({ url: reqUrl, ts: now() });
-      if (item.requests.length > MAX_REQS_PER_DOMAIN) {
-        item.requests.sort((a, b) => b.ts - a.ts);
-        item.requests = item.requests.slice(0, MAX_REQS_PER_DOMAIN);
-      }
-    }
-    item.ts = now();
-    domainStatus[domain] = item;
+    const t = Date.now();
+    item.requestsMap ??= new Map<string, number>();
+    item.requestsMap.set(reqUrl, t);
+    item.ts = t;
+    dsSet(domain, item);
     dirty.domainStatus = true;
     log('debug', `[context] request + ${reqUrl} -> ${domain} (reqs=${item.requests?.length ?? 0})`);
+    // If already UNREGISTERED, push this context to the available list immediately
+    if (item.status === 'unregistered') {
+      upsertAvailable({
+        domain,
+        method: item.method ?? null,
+        ts: item.ts,
+        requests: [{ url: reqUrl, ts: t }],
+      });
+      persistSoon();
+    }
   } finally {
     stop();
   }
@@ -1024,19 +1260,58 @@ function addRequestContext(domain: string, reqUrl?: string | null) {
 function mergeContextsInto(cands: string[], into: DomainInfo) {
   const stop = profTic('mergeContextsInto');
   try {
+    if (cands.length === 1) {
+      const ds = dsGet(cands[0]!) || null;
+      if (ds) {
+        // Prefer maps (live, in-memory). Fall back to arrays if present.
+        const pageEntries: [string, number][] = ds.pagesMap
+          ? Array.from(ds.pagesMap.entries())
+          : (ds.pages ?? []).map((p) => [p.url, p.ts]);
+        const reqEntries: [string, number][] = ds.requestsMap
+          ? Array.from(ds.requestsMap.entries())
+          : (ds.requests ?? []).map((r) => [r.url, r.ts]);
+
+        into.pages = pageEntries
+          .map(([url, ts]) => ({ url, ts }))
+          .sort((a, b) => b.ts - a.ts)
+          .slice(0, MAX_PAGES_PER_DOMAIN);
+        into.requests = reqEntries
+          .map(([url, ts]) => ({ url, ts }))
+          .sort((a, b) => b.ts - a.ts)
+          .slice(0, MAX_REQS_PER_DOMAIN);
+      } else {
+        into.pages = [];
+        into.requests = [];
+      }
+      return;
+    }
     const pages = new Map<string, number>();
     const reqs = new Map<string, number>();
     for (const cand of cands) {
-      const ds = domainStatus[cand];
+      const ds = dsGet(cand);
       if (!ds) {
         continue;
       }
-      (ds.pages ?? []).forEach((p) =>
-        pages.set(p.url, Math.max(pages.get(p.url) || 0, Number(p.ts) || 0)),
-      );
-      (ds.requests ?? []).forEach((r) =>
-        reqs.set(r.url, Math.max(reqs.get(r.url) || 0, Number(r.ts) || 0)),
-      );
+      if (ds.pagesMap) {
+        for (const [u, t] of ds.pagesMap) {
+          pages.set(u, Math.max(pages.get(u) || 0, t));
+        }
+      }
+      if (ds.pages) {
+        for (const p of ds.pages) {
+          pages.set(p.url, Math.max(pages.get(p.url) || 0, p.ts));
+        }
+      }
+      if (ds.requestsMap) {
+        for (const [u, t] of ds.requestsMap) {
+          reqs.set(u, Math.max(reqs.get(u) || 0, t));
+        }
+      }
+      if (ds.requests) {
+        for (const r of ds.requests) {
+          reqs.set(r.url, Math.max(reqs.get(r.url) || 0, r.ts));
+        }
+      }
     }
     const mergedPages = Array.from(pages.entries())
       .map(([url, ts]) => ({ url, ts }))
@@ -1057,62 +1332,41 @@ function propagateStatus(cands: string[], result: DomainInfo) {
   const stop = profTic('propagateStatus');
 
   try {
-    const ts = now();
+    const ts = Date.now();
     mergeContextsInto(cands, result);
 
     for (const cand of cands) {
-      domainStatus[cand] = {
+      const prev = dsGet(cand);
+      const wasResolved = !!prev && prev.status !== 'pending' && prev.status !== 'unknown';
+      const next: DomainInfo = {
         ...result,
         ts,
         ...(result.pages ? { pages: result.pages } : {}),
         ...(result.requests ? { requests: result.requests } : {}),
       };
+      dsSet(cand, next);
+      const isResolved = next.status !== 'pending' && next.status !== 'unknown';
+      if (!wasResolved && isResolved) {
+        cacheResolvedCount++;
+      }
     }
     dirty.domainStatus = true;
 
     const shortest = cands[0]!; // registrable
     if (result.status === 'unregistered') {
-      const existing = availableList.find((x) => x.domain === shortest);
-      if (existing) {
-        const pm = new Map<string, number>((existing.pages ?? []).map((p) => [p.url, p.ts]));
-        (result.pages ?? []).forEach((p) => pm.set(p.url, Math.max(pm.get(p.url) || 0, p.ts)));
-        existing.pages = Array.from(pm.entries())
-          .map(([url, ts]) => ({ url, ts }))
-          .sort((a, b) => b.ts - a.ts)
-          .slice(0, MAX_PAGES_PER_DOMAIN);
-
-        const rm = new Map<string, number>((existing.requests ?? []).map((r) => [r.url, r.ts]));
-        (result.requests ?? []).forEach((r) => rm.set(r.url, Math.max(rm.get(r.url) || 0, r.ts)));
-        existing.requests = Array.from(rm.entries())
-          .map(([url, ts]) => ({ url, ts }))
-          .sort((a, b) => b.ts - a.ts)
-          .slice(0, MAX_REQS_PER_DOMAIN);
-
-        existing.method = result.method ?? existing.method ?? null;
-        existing.ts = ts;
-        dirty.availableList = true;
-
-        log(
-          'debug',
-          `[availableList] updated ${shortest} pages=${existing.pages?.length ?? 0} reqs=${existing.requests?.length ?? 0}`,
-        );
-        persistSoon();
-      } else {
-        availableList.push({
-          domain: shortest,
-          method: result.method ?? null,
-          ts,
-          ...(result.pages ? { pages: result.pages } : {}),
-          ...(result.requests ? { requests: result.requests } : {}),
-        });
-        dirty.availableList = true;
-        hasNew = true;
-        log(
-          'debug',
-          `[availableList] added ${shortest} pages=${result.pages?.length ?? 0} reqs=${result.requests?.length ?? 0}`,
-        );
-        persistSoon();
-      }
+      upsertAvailable({
+        domain: shortest,
+        method: result.method ?? null,
+        ts,
+        ...(result.pages ? { pages: result.pages } : {}),
+        ...(result.requests ? { requests: result.requests } : {}),
+      });
+      hasNew = true;
+      log(
+        'debug',
+        `[availableList] upsert ${shortest} pages=${result.pages?.length ?? 0} reqs=${result.requests?.length ?? 0}`,
+      );
+      persistSoon();
     }
   } finally {
     stop();
@@ -1122,10 +1376,11 @@ function propagateStatus(cands: string[], result: DomainInfo) {
 function ensureEnqueued(regDomain: string, origHost: string, source: string) {
   const stop = profTic('ensureEnqueued');
   try {
-    const t = now();
+    const t = Date.now();
 
     // throttle: if we queued this recently, skip
-    if (lastQueued[regDomain] && t - lastQueued[regDomain] < ENQUEUE_TTL_MS) {
+    const lastQ = lastQueued.get(regDomain);
+    if (lastQ && t - lastQ < ENQUEUE_TTL_MS) {
       log('debug', `[queue] skip-throttle ${regDomain} (src=${source})`);
       return;
     }
@@ -1135,7 +1390,7 @@ function ensureEnqueued(regDomain: string, origHost: string, source: string) {
       const ds = domainStatus[regDomain];
       if (ds.status !== 'pending' && ds.status !== 'error') {
         const expiredSoft =
-          ds.method === 'dns' && typeof ds.softUntil === 'number' && now() > ds.softUntil;
+          ds.method === 'dns' && typeof ds.softUntil === 'number' && Date.now() > ds.softUntil;
         if (!expiredSoft) {
           log(
             'debug',
@@ -1162,7 +1417,9 @@ function ensureEnqueued(regDomain: string, origHost: string, source: string) {
     itemToHost.set(regDomain, origHost);
     queue.push(regDomain);
     queued.add(regDomain);
-    lastQueued[regDomain] = t;
+    lastQueued.set(regDomain, t);
+    // track for expiry
+    lastQueuedQueue.push({ key: regDomain, ts: t });
     log(
       'debug',
       `[queue] + ${regDomain} (src=${source}) size=${queue.length} inflight=${inflight}`,
@@ -1192,7 +1449,7 @@ async function checkRegistrable(registrable: string) {
           method: 'rdap',
           http: 200,
           url: resp.finalUrl,
-          ts: now(),
+          ts: Date.now(),
         };
         propagateStatus(cands, result);
         log('debug', `[check] ${registrable} -> registered (rdap 200)`);
@@ -1210,7 +1467,7 @@ async function checkRegistrable(registrable: string) {
             method: 'rdap',
             http: 404,
             url: resp.finalUrl,
-            ts: now(),
+            ts: Date.now(),
           };
           propagateStatus(cands, result);
           log('debug', `[check] ${registrable} -> unregistered (rdap 404 via redirect)`);
@@ -1224,7 +1481,7 @@ async function checkRegistrable(registrable: string) {
               ...result,
               http: result.http ?? 0,
               url: result.url ?? '',
-              ts: now(),
+              ts: Date.now(),
             });
             log(
               'debug',
@@ -1237,7 +1494,7 @@ async function checkRegistrable(registrable: string) {
           'warn',
           `[check] ${registrable} rdap 404 on aggregator; DNS inconclusive -> keeping 'pending'`,
         );
-        delete lastQueued[registrable];
+        lastQueued.delete(registrable);
         return;
       }
 
@@ -1253,7 +1510,7 @@ async function checkRegistrable(registrable: string) {
               ...result,
               http: result.http ?? 0,
               url: result.url ?? '',
-              ts: now(),
+              ts: Date.now(),
             });
             log(
               'debug',
@@ -1265,7 +1522,7 @@ async function checkRegistrable(registrable: string) {
               'warn',
               `[check] ${registrable} rdap network failure; dns fallback inconclusive -> keeping 'pending' so it will retry`,
             );
-            delete lastQueued[registrable]; // lift throttle so a new signal can re-enqueue immediately
+            lastQueued.delete(registrable);
           }
         } catch (e) {
           // SOFT FAIL: keep pending
@@ -1273,7 +1530,7 @@ async function checkRegistrable(registrable: string) {
             'warn',
             `[check] ${registrable} rdap network failure and dns fallback failed: ${errToStr(e)} -> keeping 'pending'`,
           );
-          delete lastQueued[registrable];
+          lastQueued.delete(registrable);
         }
         return;
       }
@@ -1284,7 +1541,7 @@ async function checkRegistrable(registrable: string) {
         method: 'rdap',
         http: resp.status,
         url: resp.finalUrl,
-        ts: now(),
+        ts: Date.now(),
       };
       propagateStatus(cands, result);
       log('debug', `[check] ${registrable} -> error http=${resp.status}`);
@@ -1337,12 +1594,14 @@ chrome.webRequest.onBeforeRequest.addListener(
     const { url: requestUrl, tabId, requestId, frameId } = details as any;
 
     if (requestId) {
-      const t = now();
-      if (seenRequestIds[requestId] && t - seenRequestIds[requestId] < REQ_TTL_MS) {
+      const t = Date.now();
+      const prev = seenRequestIds.get(requestId);
+      if (prev && t - prev < REQ_TTL_MS) {
         log('debug', `[signal:beforeRequest] skip-dup rid=${requestId} url=${requestUrl}`);
         return;
       }
-      seenRequestIds[requestId] = t;
+      seenRequestIds.set(requestId, t);
+      seenReqQueue.push({ key: requestId, ts: t });
     }
 
     if (
@@ -1366,15 +1625,19 @@ chrome.webRequest.onBeforeRequest.addListener(
         return;
       }
 
-      const t = now();
+      const t = Date.now();
       const prev = hostSeen[host] || 0;
-      hostSeen[host] = t;
+      const existed = hsGet(host) != null;
+      hsBump(host, t);
+      if (!existed) {
+        hostSeenNewSincePersist++;
+      }
       if (t - prev >= HOST_SEEN_BUMP_MS) {
         dirty.hostSeen = true;
         persistSoon();
       }
 
-      const info = parse(host); // ICANN-only by default
+      const info = parseHostCached(host); // ICANN-only by default
       if (!info.domain || info.isIp || !info.isIcann) {
         log(
           'debug',
@@ -1404,7 +1667,7 @@ chrome.webRequest.onBeforeRequest.addListener(
           method: null,
           http: 0,
           url: '',
-          ts: now(),
+          ts: Date.now(),
           pages: [],
           requests: [],
         };
@@ -1427,12 +1690,14 @@ chrome.webRequest.onErrorOccurred.addListener(
     const { tabId, requestId, frameId } = details as any;
 
     if (requestId) {
-      const t = now();
-      if (seenRequestIds[requestId] && t - seenRequestIds[requestId] < REQ_TTL_MS) {
+      const t = Date.now();
+      const prev = seenRequestIds.get(requestId);
+      if (prev && t - prev < REQ_TTL_MS) {
         log('debug', `[signal:errorOccurred] skip-dup rid=${requestId} url=${details.url}`);
         return;
       }
-      seenRequestIds[requestId] = t;
+      seenRequestIds.set(requestId, t);
+      seenReqQueue.push({ key: requestId, ts: t });
     }
 
     if (!details?.url) {
@@ -1457,7 +1722,7 @@ chrome.webRequest.onErrorOccurred.addListener(
         return;
       }
 
-      const info = parse(host);
+      const info = parseHostCached(host);
       if (!info.domain || info.isIp || !info.isIcann) {
         log(
           'debug',
@@ -1487,7 +1752,7 @@ chrome.webRequest.onErrorOccurred.addListener(
           method: null,
           http: 0,
           url: '',
-          ts: now(),
+          ts: Date.now(),
           pages: [],
           requests: [],
         };
@@ -1518,7 +1783,7 @@ chrome.runtime.onMessage.addListener(
 
     if (msg?.type === 'getLogs') {
       pruneLogsTTL();
-      sendResponse({ logs, debugEnabled });
+      sendResponse({ logs: logsToArray(), debugEnabled });
       return true;
     }
 
@@ -1532,9 +1797,9 @@ chrome.runtime.onMessage.addListener(
     }
 
     if (msg?.type === 'clearLogs') {
-      logs = [];
+      logsClear();
       void storage
-        .set({ logs })
+        .set({ logs: [] })
         .catch((e) => log('error', 'clearLogs storage.set failed: ' + errToStr(e)));
       sendResponse({ ok: true });
       return true;
@@ -1542,19 +1807,9 @@ chrome.runtime.onMessage.addListener(
 
     if (msg?.type === 'getState') {
       // Return authoritative in-memory state; don't overwrite it from storage here.
-      let cacheSize = 0;
-      for (const dkey of Object.keys(domainStatus)) {
-        const d = domainStatus[dkey];
-        if (!d) {
-          continue;
-        }
-        if (d.status !== 'pending' && d.status !== 'unknown') {
-          cacheSize += 1;
-        }
-      }
       sendResponse({
         availableList,
-        cacheSize: cacheSize,
+        cacheSize: cacheResolvedCount,
         hostsSeen: Object.keys(hostSeen).length,
       });
       return true;
@@ -1563,7 +1818,10 @@ chrome.runtime.onMessage.addListener(
     if (msg?.type === 'clearCache') {
       hostSeen = {};
       domainStatus = {};
-      queue = [];
+      cacheResolvedCount = 0;
+      hostSeenMem.clear();
+      domainStatusMem.clear();
+      queue.clear();
       hasNew = false;
       updateBadgeSoon();
       try {
@@ -1572,9 +1830,7 @@ chrome.runtime.onMessage.addListener(
         log('error', 'clearCache active.clear failed: ' + errToStr(e));
         persistLogsSoon();
       }
-      for (const k of Object.keys(lastQueued)) {
-        delete lastQueued[k];
-      }
+      lastQueued.clear();
       queued.clear();
       try {
         (itemToHost as any).clear?.();
@@ -1582,6 +1838,9 @@ chrome.runtime.onMessage.addListener(
         log('error', 'clearCache itemToHost.clear failed: ' + errToStr(e));
         persistLogsSoon();
       }
+      try {
+        tldCache.clear();
+      } catch {}
       void storage
         .set({ hostSeen, domainStatus })
         .catch((e) => log('error', 'clearCache storage.set failed: ' + errToStr(e)));
@@ -1661,14 +1920,14 @@ chrome.runtime.onMessage.addListener(
         try {
           if (pageUrl) {
             const ph = normalizeHost(new URL(pageUrl).hostname);
-            const info = ph ? parse(ph) : ({} as any);
+            const info = ph ? parseHostCached(ph) : ({} as any);
             if (info.domain && info.isIcann && !info.isIp) {
               registrable = info.domain;
             }
           }
         } catch {}
         if (!registrable && blockedHost) {
-          const info = parse(blockedHost);
+          const info = parseHostCached(blockedHost);
           if (info.domain && info.isIcann && !info.isIp) {
             registrable = info.domain;
           }
@@ -1689,7 +1948,7 @@ chrome.runtime.onMessage.addListener(
               method: null,
               http: 0,
               url: '',
-              ts: now(),
+              ts: Date.now(),
               pages: [],
               requests: [],
             };
@@ -1713,11 +1972,15 @@ chrome.runtime.onMessage.addListener(
 
     if (msg?.type === 'recheckDomain' && typeof msg.domain === 'string') {
       const host = normalizeHost(msg.domain);
-      const info = host ? parse(host) : null;
+      const info = host ? parseHostCached(host) : null;
       const registrable = info && info.domain && info.isIcann && !info.isIp ? info.domain : null;
       if (registrable) {
-        delete domainStatus[registrable];
-        delete lastQueued[registrable];
+        const prev = dsGet(registrable);
+        if (prev && prev.status !== 'pending' && prev.status !== 'unknown') {
+          cacheResolvedCount = Math.max(0, cacheResolvedCount - 1);
+        }
+        dsDelete(registrable);
+        lastQueued.delete(registrable);
         const hostHint = itemToHost.get(registrable) || host || registrable;
         ensureEnqueued(registrable, hostHint, 'recheck');
         sendResponse({ ok: true });
@@ -1741,9 +2004,29 @@ async function init() {
   ]);
   hostSeen = s.hostSeen || {};
   domainStatus = s.domainStatus || {};
+  Object.entries(hostSeen)
+    .sort((a, b) => (a[1] ?? 0) - (b[1] ?? 0))
+    .forEach(([k, v]) => hostSeenMem.set(k, v));
+  Object.entries(domainStatus)
+    .sort((a, b) => ((a[1] as any)?.ts ?? 0) - ((b[1] as any)?.ts ?? 0))
+    .forEach(([k, v]) => domainStatusMem.set(k, v));
   availableList = s.availableList || [];
+  // Rebuild available index so upserts land on existing items
+  availableIdx.clear();
+  for (let i = 0; i < availableList.length; i++) {
+    const d = availableList[i]!;
+    if (d && d.domain) {
+      availableIdx.set(d.domain, i);
+    }
+  }
   tabTopUrl = s.tabTopUrl || {};
-  logs = Array.isArray(s.logs) ? s.logs : [];
+  const persistedLogs = Array.isArray(s.logs) ? s.logs : [];
+  logsClear();
+  for (const e of persistedLogs) {
+    if (e && typeof e.ts === 'number') {
+      logsPush(e);
+    }
+  }
   pruneLogsTTL();
   debugEnabled = !!s.debugEnabled;
   updateBadge();

@@ -10,7 +10,7 @@
     "lint": "eslint \"src/**/*.{ts,tsx,mts,cts}\" --cache",
     "format": "prettier --check .",
     "fix": "eslint \"src/**/*.{ts,tsx,mts,cts}\" --cache --fix && prettier --write .",
-    "prebuild": "pnpm typecheck && prettier --write .",
+    "prebuild": "pnpm typecheck && pnpm lint && pnpm format",
     "build:chrome": "node scripts/build.mjs chrome",
     "build:firefox": "node scripts/build.mjs firefox",
     "build": "pnpm run build:chrome && pnpm run build:firefox",

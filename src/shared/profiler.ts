@@ -95,9 +95,9 @@ class _Profiler {
   private maybeReport(label: string, b: Bucket) {
     const now = performance.now();
     if (b.lastReport !== 0 && now - b.lastReport < this.reportEveryMs) {
-    if (now - b.lastReport < this.reportEveryMs) {
       return;
     }
+
     b.lastReport = now;
     const avg = b.k ? b.totalMs / b.k : 0;
     // Effective avg per call (including non-profiled) ~ avg / sampleEvery
