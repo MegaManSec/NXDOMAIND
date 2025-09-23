@@ -80,3 +80,7 @@ Edit `src/background.ts`:
 - `TAB_HISTORY_MAX` – max history entries per tab.
 - `MAX_LOGS` – max in-memory log lines (with recent-first trimming).
 - `LOG_TTL_MS` – drop logs older than this duration.
+
+## TODO
+
+Cleanup, document proper tunings, and fix CSP.
