@@ -31,6 +31,7 @@ const MAX_DOMAINS = 1_000_000; // Total maximum *domains* (eTLD+1, domain.com) k
 const MAX_HOSTS = 1_000_000; // Total maximum *hosts* (subdomain.domain.com) kept in the cache.
 const MAX_PAGES_PER_DOMAIN = 200; // Total maximum "Pages observed on:" (https://html-viewer.com/)
 const MAX_REQS_PER_DOMAIN = 200; // Total maximum "Requests made to this domain:" (https://example.com/page1, https://example.com/page2)
+const MAX_URLS_PER_DOMAIN_MAP = 5000; // Cap live per-domain in-memory URL maps (pagesMap/requestsMap)
 
 const REQ_GC_WINDOW_MS = 30_000; // GC seen requestIds
 const REQ_TTL_MS = 1_500; // suppress duplicate events for same requestId
@@ -85,6 +86,16 @@ let domainStatus: Record<string, DomainInfo> = {};
 const hostSeenMem = new Map<string, number>(); // LRU by insertion
 const domainStatusMem = new Map<string, DomainInfo>(); // LRU by insertion
 
+let availableList: {
+  domain: string;
+  method: Method;
+  ts: number;
+  pages?: PageRef[];
+  requests?: PageRef[];
+}[] = [];
+const availableIdx = new Map<string, number>();
+const MAX_AVAILABLE = 50_000;
+
 function hsGet(k: string) {
   return hostSeenMem.get(k) ?? hostSeen[k];
 }
@@ -109,15 +120,19 @@ function dsDelete(k: string) {
   domainStatusMem.delete(k);
   delete domainStatus[k];
 }
-let availableList: {
-  domain: string;
-  method: Method;
-  ts: number;
-  pages?: PageRef[];
-  requests?: PageRef[];
-}[] = [];
-const availableIdx = new Map<string, number>();
-const MAX_AVAILABLE = 50_000;
+function hardDropDomain(registrable: string) {
+  const prev = dsGet(registrable);
+  if (prev && prev.status !== 'pending' && prev.status !== 'unknown') {
+    cacheResolvedCount = Math.max(0, cacheResolvedCount - 1);
+  }
+  dsDelete(registrable);
+  lastQueued.delete(registrable);
+  queued.delete(registrable);
+  active.delete(registrable);
+  inflightByDomain.delete(registrable);
+  itemToHost.delete(registrable);
+  dirty.domainStatus = true;
+}
 
 // Merge two PageRef lists by URL, keeping the latest ts, sorted desc, capped
 function mergeRefs(oldArr?: PageRef[], newArr?: PageRef[], cap = 200): PageRef[] {
@@ -503,6 +518,19 @@ function persistLogsSoon() {
   }
 }
 
+function trimMapByMostRecent(m: Map<string, number>, cap = MAX_URLS_PER_DOMAIN_MAP) {
+  if (!m || m.size <= cap) {
+    return;
+  }
+  const top = Array.from(m.entries())
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, cap);
+  m.clear();
+  for (const [k, v] of top) {
+    m.set(k, v);
+  }
+}
+
 function normalizeHost(h?: string | null) {
   if (!h) {
     return null;
@@ -825,6 +853,14 @@ function prune() {
       if (ds.requests && ds.requests.length > MAX_REQS_PER_DOMAIN) {
         ds.requests.sort((a, b) => b.ts - a.ts);
         ds.requests = ds.requests.slice(0, MAX_REQS_PER_DOMAIN);
+        modifiedDomainStatus = true;
+      }
+      if (ds.pagesMap && ds.pagesMap.size > MAX_URLS_PER_DOMAIN_MAP) {
+        trimMapByMostRecent(ds.pagesMap);
+        modifiedDomainStatus = true;
+      }
+      if (ds.requestsMap && ds.requestsMap.size > MAX_URLS_PER_DOMAIN_MAP) {
+        trimMapByMostRecent(ds.requestsMap);
         modifiedDomainStatus = true;
       }
     }
@@ -1201,6 +1237,7 @@ function addPageContext(domain: string, pageUrl?: string | null) {
     const t = Date.now();
     item.pagesMap ??= new Map<string, number>();
     item.pagesMap.set(pageUrl, t);
+    trimMapByMostRecent(item.pagesMap);
     item.ts = t;
     dsSet(domain, item);
     dirty.domainStatus = true;
@@ -1238,6 +1275,7 @@ function addRequestContext(domain: string, reqUrl?: string | null) {
     const t = Date.now();
     item.requestsMap ??= new Map<string, number>();
     item.requestsMap.set(reqUrl, t);
+    trimMapByMostRecent(item.requestsMap);
     item.ts = t;
     dsSet(domain, item);
     dirty.domainStatus = true;
@@ -1492,9 +1530,9 @@ async function checkRegistrable(registrable: string) {
         } catch {}
         log(
           'warn',
-          `[check] ${registrable} rdap 404 on aggregator; DNS inconclusive -> keeping 'pending'`,
+          `[check] ${registrable} rdap 404 on aggregator; DNS inconclusive -> DROP domain (no re-enqueue)`,
         );
-        lastQueued.delete(registrable);
+        hardDropDomain(registrable);
         return;
       }
 
@@ -1517,20 +1555,18 @@ async function checkRegistrable(registrable: string) {
               `[check] ${registrable} -> ${result.status} (dns fallback after rdap network failure)`,
             );
           } else {
-            // SOFT FAIL: keep pending (no propagateStatus), so it retries on next signal.
             log(
               'warn',
-              `[check] ${registrable} rdap network failure; dns fallback inconclusive -> keeping 'pending' so it will retry`,
+              `[check] ${registrable} rdap network failure; DNS inconclusive -> DROP domain (no re-enqueue)`,
             );
-            lastQueued.delete(registrable);
+            hardDropDomain(registrable);
           }
         } catch (e) {
-          // SOFT FAIL: keep pending
           log(
             'warn',
-            `[check] ${registrable} rdap network failure and dns fallback failed: ${errToStr(e)} -> keeping 'pending'`,
+            `[check] ${registrable} rdap network failure and dns fallback failed: ${errToStr(e)} -> DROP domain (no re-enqueue)`,
           );
-          lastQueued.delete(registrable);
+          hardDropDomain(registrable);
         }
         return;
       }
